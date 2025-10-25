@@ -6,7 +6,7 @@ This project is an interactive web application designed to perform comprehensive
 
 The tool leverages Python libraries for data fetching and analysis, with a user-friendly interface built using Streamlit. It includes advanced features like automatic WACC calculation, sensitivity analysis, and reverse DCF to assess implied growth rates.
 
-**Live Demo URL:** [(your_streamlit_app_url)](https://valuationdashboard-ryankelley.streamlit.app/)
+**Live Demo URL:** [(https://valuationdashboard-ryankelley.streamlit.app/)
 
 ---
 
