@@ -38,8 +38,10 @@ The tool leverages Python libraries for data fetching and analysis, with a user-
 
 ## Demo
 
-*(Replace the image link with your actual GIF)*
-![Financial Valuation Dashboard Demo](link_to_your_gif.gif)
+
+
+https://github.com/user-attachments/assets/6bbe30ea-a36b-4501-b677-6608a3151299
+
 
 A brief walkthrough showing the main features: entering a ticker, adjusting DCF assumptions, viewing the Comps table, and interpreting the Sensitivity Analysis and Reverse DCF.
 
