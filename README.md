@@ -1,4 +1,4 @@
-# Financial Valuation Dashboard 📈📊
+# Financial Valuation Dashboard
 
 ## Overview
 
