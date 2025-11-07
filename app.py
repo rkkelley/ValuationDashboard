@@ -128,9 +128,9 @@ def get_wacc_components(_stock, _financials, _balance_sheet, rf_rate, erp, tax_r
             if calculated_rd >= rf_rate:
                 cost_of_debt = calculated_rd
             else:
-                 # If calculated Rd is too low, keep the fallback but log a warning (optional)
-                 print(f"Warning: Calculated Rd ({calculated_rd:.2%}) for {info.get('symbol', '')} is below Rf ({rf_rate:.2%}). Using fallback Rd {cost_of_debt_fallback:.2%}.")
-                 cost_of_debt = cost_of_debt_fallback # Explicitly ensure fallback is used
+                # If calculated Rd is too low, keep the fallback but log a warning (optional)
+                print(f"Warning: Calculated Rd ({calculated_rd:.2%}) for {info.get('symbol', '')} is below Rf ({rf_rate:.2%}). Using fallback Rd {cost_of_debt_fallback:.2%}.")
+                cost_of_debt = cost_of_debt_fallback # Explicitly ensure fallback is used
 
         except ZeroDivisionError:
              pass # Keep the initial fallback if division fails
@@ -154,7 +154,7 @@ def get_wacc_components(_stock, _financials, _balance_sheet, rf_rate, erp, tax_r
 
 
 # --- NEW: Helper Function for Sensitivity Analysis ---
-def calculate_dcf_price(fcf, g_rate_1, g_rate_2, t_rate, wacc, shares_outstanding, total_debt, cash):
+def calculate_dcf_price(fcf, g_rate_1, g_rate_2, t_rate, wacc, shares_outstanding, total_debt, cash, duration_1=5, duration_2=5):
     """Recalculates DCF Implied Price for given assumptions."""
     try:
         # --- Basic Validations ---
@@ -166,11 +166,12 @@ def calculate_dcf_price(fcf, g_rate_1, g_rate_2, t_rate, wacc, shares_outstandin
             return np.nan
 
         # --- 1. Project FCF for 10 years ---
+        total_duration = duration_1 + duration_2 # ADDED
         projected_fcf = []
         fcf_year = fcf
-        for year in range(1, 11):
-            # First 5 years: higher growth, next 5 years: moderate growth
-            growth = g_rate_1 if year <= 5 else g_rate_2
+        for year in range(1, total_duration + 1): # CHANGED
+            # First N years: higher growth, next M years: moderate growth
+            growth = g_rate_1 if year <= duration_1 else g_rate_2 # CHANGED
             fcf_year *= (1 + growth)
             projected_fcf.append(fcf_year)
 
@@ -179,9 +180,9 @@ def calculate_dcf_price(fcf, g_rate_1, g_rate_2, t_rate, wacc, shares_outstandin
 
         # --- 3. Discount All Cash Flows ---
         discounted_fcf = [
-            projected_fcf[i] / ((1 + wacc) ** (i + 1)) for i in range(10)
+            projected_fcf[i] / ((1 + wacc) ** (i + 1)) for i in range(total_duration) # CHANGED
         ]
-        discounted_tv = terminal_value / ((1 + wacc) ** 10)
+        discounted_tv = terminal_value / ((1 + wacc) ** total_duration) # CHANGED
 
         # --- 4. Enterprise Value ---
         enterprise_value = sum(discounted_fcf) + discounted_tv
@@ -204,7 +205,7 @@ def calculate_dcf_price(fcf, g_rate_1, g_rate_2, t_rate, wacc, shares_outstandin
 
 @st.cache_data(ttl=600)
 # --- Reverse DCF Helper Function ---
-def reverse_dcf(current_price, fcf, g_rate_2, t_rate, wacc, shares_outstanding, total_debt, cash, years=5):
+def reverse_dcf(current_price, fcf, g_rate_2, t_rate, wacc, shares_outstanding, total_debt, cash, duration_1=5, duration_2=5):
     """
     Calculate the implied short-term growth rate (g_rate_1) required to justify current_price.
     Uses binary search.
@@ -229,6 +230,7 @@ def reverse_dcf(current_price, fcf, g_rate_2, t_rate, wacc, shares_outstanding, 
         print(f"Reverse DCF Target EV Calculation Failed or Non-positive: target_ev={target_ev}")
         return None
 
+    total_duration = duration_1 + duration_2 # ADDED
 
     # Binary search for g_rate_1
     low, high = -0.50, 2.00  # Allow negative growth up to 200% growth
@@ -242,22 +244,22 @@ def reverse_dcf(current_price, fcf, g_rate_2, t_rate, wacc, shares_outstanding, 
             projected_fcf = []
             last_fcf = fcf
             # Stage 1: High growth using 'mid' rate
-            for _ in range(years):
+            for _ in range(duration_1): # CHANGED
                 last_fcf *= (1 + mid)
                 projected_fcf.append(last_fcf)
             # Stage 2: Stable growth using g_rate_2
-            for _ in range(years): # Years 6-10
+            for _ in range(duration_2): # CHANGED
                 last_fcf *= (1 + g_rate_2)
                 projected_fcf.append(last_fcf)
 
             # Clean projected FCF list and check validity
             projected_fcf = [safe_float(val) for val in projected_fcf]
             if not projected_fcf or projected_fcf[-1] == 0 or any(math.isinf(f) or math.isnan(f) for f in projected_fcf):
-                 # If projection fails or leads to non-finite numbers, adjust search range
-                 # print(f"Iter {iteration}: Invalid FCF projection for mid={mid:.4f}. Adjusting range.")
-                 if mid > 0 : high = mid # If positive growth failed, try lower
-                 else: low = mid      # If negative growth failed, try higher (less negative)
-                 continue # Skip rest of loop for this iteration
+                # If projection fails or leads to non-finite numbers, adjust search range
+                # print(f"Iter {iteration}: Invalid FCF projection for mid={mid:.4f}. Adjusting range.")
+                if mid > 0 : high = mid # If positive growth failed, try lower
+                else: low = mid      # If negative growth failed, try higher (less negative)
+                continue # Skip rest of loop for this iteration
 
 
             terminal_value = (projected_fcf[-1] * (1 + t_rate)) / (wacc - t_rate)
@@ -266,7 +268,7 @@ def reverse_dcf(current_price, fcf, g_rate_2, t_rate, wacc, shares_outstanding, 
             discounted_values = [fcf_year / (1 + wacc)**(i + 1) for i, fcf_year in enumerate(projected_fcf)]
             discounted_values = [safe_float(val) for val in discounted_values] # Clean
 
-            discounted_terminal_value = terminal_value / (1 + wacc)**(10) # Discount over 10 years
+            discounted_terminal_value = terminal_value / (1 + wacc)**(total_duration) # CHANGED
             discounted_terminal_value = safe_float(discounted_terminal_value) # Clean
 
             enterprise_value = sum(discounted_values) + discounted_terminal_value
@@ -329,17 +331,31 @@ st.sidebar.markdown("""
 """)
 
 g_rate_1_percent = st.sidebar.slider(
-    "Growth Rate (Years 1-5):", 1, 50, 30, format="%d%%",
-    help="The expected FCF growth rate for the first 5 years."
+    "Growth Rate (Stage 1):", 1, 50, 30, format="%d%%",
+    help="The expected FCF growth rate for the first (short-term) stage."
 )
 g_rate_2_percent = st.sidebar.slider(
-    "Growth Rate (Years 6-10):", 1, 20, 10, format="%d%%",
-    help="The FCF growth rate for the next 5 years (stable growth phase)."
+    "Growth Rate (Stage 2):", 1, 20, 10, format="%d%%",
+    help="The FCF growth rate for the second (medium-term) stage."
 )
 t_rate_percent = st.sidebar.slider(
     "Perpetual Growth Rate (Terminal):", 1, 5, 2, format="%d%%",
-    help="The long-term growth rate of FCF after Year 10."
+    help="The long-term growth rate of FCF after the projection period."
 )
+
+# --- NEW: Duration Sliders ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("**DCF Duration (Years)**")
+duration_1 = st.sidebar.slider(
+    "Short-Term Growth Duration (Stage 1):", 1, 10, 5, format="%d years",
+    help="The number of years for the short-term (Stage 1) growth rate."
+)
+duration_2 = st.sidebar.slider(
+    "Medium-Term Growth Duration (Stage 2):", 1, 10, 5, format="%d years",
+    help="The number of years for the medium-term (Stage 2) growth rate."
+)
+# --- End New ---
+
 
 # --- WACC Calculation Section ---
 st.sidebar.subheader("Discount Rate (WACC)")
@@ -378,6 +394,7 @@ if run_button:
     g_rate_1 = g_rate_1_percent / 100.0
     g_rate_2 = g_rate_2_percent / 100.0
     t_rate = t_rate_percent / 100.0
+    # Durations are used directly as integers (duration_1, duration_2)
 
     try:
         stock = yf.Ticker(ticker)
@@ -436,6 +453,8 @@ if run_button:
         # --- DCF Valuation ---
         st.subheader("Discounted Cash Flow (DCF) Valuation")
         st.write(f"Using Discount Rate (WACC): **{wacc:.2%}**")
+        st.write(f"Projection: **{duration_1}** years (Stage 1) + **{duration_2}** years (Stage 2) = **{duration_1 + duration_2}** total years.")
+
 
         # Get FCF
         fcf = 0.0
@@ -460,8 +479,9 @@ if run_button:
             fcf = 0
 
         # Initialize DCF variables outside the 'if fcf > 0' block
-        projected_fcf = [0.0] * 10
-        discounted_values = [0.0] * 10
+        total_duration = duration_1 + duration_2 # ADDED
+        projected_fcf = [0.0] * total_duration # CHANGED
+        discounted_values = [0.0] * total_duration # CHANGED
         terminal_value = 0.0
         discounted_terminal_value = 0.0
         enterprise_value = 0.0
@@ -472,8 +492,8 @@ if run_button:
             # 1. Project FCF
             temp_projected_fcf = [] # Use a temporary list
             last_fcf = fcf
-            for i in range(1, 6): last_fcf *= (1 + g_rate_1); temp_projected_fcf.append(last_fcf)
-            for i in range(1, 6): last_fcf *= (1 + g_rate_2); temp_projected_fcf.append(last_fcf)
+            for i in range(1, duration_1 + 1): last_fcf *= (1 + g_rate_1); temp_projected_fcf.append(last_fcf) # CHANGED
+            for i in range(1, duration_2 + 1): last_fcf *= (1 + g_rate_2); temp_projected_fcf.append(last_fcf) # CHANGED
             # --- NEW: Clean projected_fcf list ---
             projected_fcf = [safe_float(val) for val in temp_projected_fcf]
 
@@ -494,7 +514,7 @@ if run_button:
                      # --- NEW: Clean discounted_values list ---
                      discounted_values = [safe_float(val) for val in temp_discounted_values]
 
-                     discounted_terminal_value = terminal_value / (1 + wacc)**10
+                     discounted_terminal_value = terminal_value / (1 + wacc)**total_duration # CHANGED
                      discounted_terminal_value = safe_float(discounted_terminal_value) # Clean dTV
 
                      # 4. Calculate Enterprise Value
@@ -536,9 +556,9 @@ if run_button:
 
                     if implied_share_price > 0 and current_price > 0:
                         if implied_share_price > current_price:
-                            st.write(f"**Result:** Based on this 2-stage DCF, the stock appears **Undervalued**.")
+                            st.write(f"**Result:** Based on this {total_duration}-year 2-stage DCF, the stock appears **Undervalued**.")
                         else:
-                            st.write(f"**Result:** Based on this 2-stage DCF, the stock appears **Overvalued**.")
+                            st.write(f"**Result:** Based on this {total_duration}-year 2-stage DCF, the stock appears **Overvalued**.")
                     else:
                          st.warning("Cannot determine valuation due to missing price data or invalid DCF result.")
 
@@ -554,27 +574,27 @@ if run_button:
                 with st.expander("View DCF Calculation Steps"):
                     try:
                         # --- Create df_fcf INSIDE the try block AFTER values are calculated ---
-                         df_fcf_display = pd.DataFrame({
-                             'Year': [f"Year {i+1}" for i in range(10)],
-                             'Projected FCF': projected_fcf, # Use cleaned list
-                             'Discounted FCF': discounted_values # Use cleaned list
-                         })
+                        df_fcf_display = pd.DataFrame({
+                            'Year': [f"Year {i+1}" for i in range(total_duration)], # CHANGED
+                            'Projected FCF': projected_fcf, # Use cleaned list
+                            'Discounted FCF': discounted_values # Use cleaned list
+                        })
 
-                         # --- Apply formatting safely column by column using format_number ---
-                         formatted_df = df_fcf_display.copy()
-                         for col in ['Projected FCF', 'Discounted FCF']:
-                             if col in formatted_df.columns:
-                                 # Use format_number for DataFrame columns
-                                 formatted_df[col] = formatted_df[col].apply(lambda x: format_number(x, decimals=2, is_dollar=True))
+                        # --- Apply formatting safely column by column using format_number ---
+                        formatted_df = df_fcf_display.copy()
+                        for col in ['Projected FCF', 'Discounted FCF']:
+                            if col in formatted_df.columns:
+                                # Use format_number for DataFrame columns
+                                formatted_df[col] = formatted_df[col].apply(lambda x: format_number(x, decimals=2, is_dollar=True))
 
-                         st.dataframe(formatted_df) # Display the manually formatted DataFrame
+                        st.dataframe(formatted_df) # Display the manually formatted DataFrame
 
-                         # --- Display other values safely using format_number ---
-                         st.write(f"Terminal Value (at Year 10): **{format_number(terminal_value, decimals=2, is_dollar=True)}**")
-                         st.write(f"Discounted Terminal Value: **{format_number(discounted_terminal_value, decimals=2, is_dollar=True)}**")
-                         st.write(f"Enterprise Value: **{format_number(enterprise_value, decimals=2, is_dollar=True)}**")
-                         st.write(f"Equity Value: **{format_number(equity_value, decimals=2, is_dollar=True)}** (EV - Debt + Cash)")
-                         st.write(f"Shares Outstanding: **{format_number(shares_outstanding, decimals=0, is_dollar=False, is_shares=True)}**") # Format shares
+                        # --- Display other values safely using format_number ---
+                        st.write(f"Terminal Value (at Year {total_duration}): **{format_number(terminal_value, decimals=2, is_dollar=True)}**")
+                        st.write(f"Discounted Terminal Value: **{format_number(discounted_terminal_value, decimals=2, is_dollar=True)}**")
+                        st.write(f"Enterprise Value: **{format_number(enterprise_value, decimals=2, is_dollar=True)}**")
+                        st.write(f"Equity Value: **{format_number(equity_value, decimals=2, is_dollar=True)}** (EV - Debt + Cash)")
+                        st.write(f"Shares Outstanding: **{format_number(shares_outstanding, decimals=0, is_dollar=False, is_shares=True)}**") # Format shares
 
                     except Exception as e_expander:
                          st.error(f"Error displaying calculation steps: {e_expander}")
@@ -621,15 +641,15 @@ if run_button:
                 ], color='#FFA0A0')
         )
 
-                # --- NEW: Sensitivity Analysis ---
+                 # --- NEW: Sensitivity Analysis ---
         # --- Sensitivity Analysis (Using Dictionary Approach) ---
         st.subheader("Sensitivity Analysis (Implied Share Price $)")
         st.caption(
-    "This table shows how the **implied share price** changes under different assumptions for the "
-    "**WACC** (discount rate) and **terminal growth rate**. "
-    "Each cell represents the fair value per share estimated by the DCF model. "
-    "Higher terminal growth or lower WACC generally lead to higher valuations."
-    )
+     "This table shows how the **implied share price** changes under different assumptions for the "
+     "**WACC** (discount rate) and **terminal growth rate**. "
+     "Each cell represents the fair value per share estimated by the DCF model. "
+     "Higher terminal growth or lower WACC generally lead to higher valuations."
+     )
 
         wacc_range = [wacc - 0.01, wacc - 0.005, wacc, wacc + 0.005, wacc + 0.01]
         t_rate_range = [t_rate - 0.005, t_rate - 0.0025, t_rate, t_rate + 0.0025, t_rate + 0.005]
@@ -660,9 +680,10 @@ if run_button:
                         # Calculate price for this specific combination
                         calculated_price = calculate_dcf_price(
                             base_fcf, g_rate_1, g_rate_2, t_sens, w_sens,
-                            base_shares, base_debt, base_cash
+                            base_shares, base_debt, base_cash,
+                            duration_1, duration_2 # ADDED
                         )
-                        # print(f"    => Price: {calculated_price:.2f}") # Keep if needed
+                        # print(f"     => Price: {calculated_price:.2f}") # Keep if needed
 
                         # Assign the result to the dictionary
                         sensitivity_results[w_key][t_key] = calculated_price
@@ -714,7 +735,7 @@ if run_button:
 
         # --- Reverse DCF Section (Simplified Interpretation) ---
         st.subheader("Reverse DCF (Implied Growth Analysis)")
-        st.caption("This calculation finds the short-term FCF growth rate (Years 1-5) that the market price implies, given your WACC, long-term growth, and terminal growth assumptions.")
+        st.caption("This calculation finds the short-term FCF growth rate (Stage 1) that the market price implies, given your WACC, growth durations, long-term growth, and terminal growth assumptions.")
 
         # Ensure necessary base variables exist and are valid floats
         current_price_rev = safe_float(info.get('currentPrice') or info.get('regularMarketPrice'))
@@ -736,15 +757,16 @@ if run_button:
                 shares_outstanding=base_shares_rev,
                 total_debt=base_debt_rev,
                 cash=base_cash_rev,
-                years=5
+                duration_1=duration_1, # CHANGED
+                duration_2=duration_2 # CHANGED
             )
 
             if implied_growth is not None:
                 st.metric(label="Current Market Price", value=f"${current_price_rev:,.2f}")
-                st.metric(label="Implied FCF Growth (Yrs 1-5)", value=f"{implied_growth:.2%}")
+                st.metric(label=f"Implied FCF Growth (Yrs 1-{duration_1})", value=f"{implied_growth:.2%}")
 
                 # --- Simplified Interpretation ---
-                interpretation = f"The current market price implies **{implied_growth:.1%}** annual FCF growth for the next 5 years. "
+                interpretation = f"The current market price implies **{implied_growth:.1%}** annual FCF growth for the next **{duration_1}** years. " # CHANGED
 
                 # Add qualitative assessment based on magnitude
                 if implied_growth > 0.30:
