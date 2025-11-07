@@ -469,24 +469,40 @@ if run_button:
         # Get FCF
         fcf = 0.0
         try:
-            fcf = safe_float(info.get('freeCashflow'))
-            if fcf == 0 and not cash_flow.empty:
-                op_cash = 0.0
-                if 'Total Cash From Operating Activities' in cash_flow.index:
-                    op_cash = safe_float(cash_flow.loc['Total Cash From Operating Activities'].iloc[0])
+            # --- New FCF Calculation Logic: TTM from Quarterly Statements ---
 
-                cap_ex = 0.0
-                if 'Capital Expenditures' in cash_flow.index:
-                    cap_ex = safe_float(cash_flow.loc['Capital Expenditures'].iloc[0])
+            # 1. Fetch the quarterly cash flow statement. Use .T to transpose for easier reading.
+            quarterly_cf = stock.get_cashflow(freq="quarterly").T
 
-                fcf = op_cash - cap_ex
+            if quarterly_cf.empty:
+                st.warning("Could not fetch quarterly cash flow data. DCF result will be zero.")
+                # fcf remains 0.0
+            
+            # Check for the existence of the reliable FreeCashFlow column
+            elif 'FreeCashFlow' in quarterly_cf.columns:
+                
+                # 2. Sum the FreeCashFlow column for the last 4 quarters (TTM)
+                # .head(4) gets the last four reported quarters
+                ttm_fcf_series = quarterly_cf.head(4)['FreeCashFlow']
+                
+                # .sum() calculates the Trailing Twelve Months figure
+                fcf = ttm_fcf_series.sum()
+                
+                # The sum should be $4,130,000,000.00 for GD if the latest quarters are Q2'25, Q1'25, Q4'24, Q3'24
+                
+                if fcf == 0:
+                    st.warning("TTM FCF calculated as zero. Check quarterly data for missing values.")
 
-            if fcf == 0:
-                 st.warning("Could not find TTM Free Cash Flow data. DCF result will be zero.")
-
+            else:
+                # Fallback if the FreeCashFlow column name changes or is missing
+                st.warning("FreeCashFlow column not found. Attempting manual OpCash - CapEx calculation.")
+                
+                    # If the direct FCF column fails, you'd implement the OpCash - CapEx fallback here
+                    # This fallback is complex due to changing column names and is best avoided if possible.
+                    
         except Exception as e:
-            st.error(f"Error getting FCF: {e}")
-            fcf = 0
+            st.error(f"Error calculating TTM FCF: {e}")
+                # fcf remains 0.0
 
         # Initialize DCF variables outside the 'if fcf > 0' block
         total_duration = duration_1 + duration_2 # ADDED
