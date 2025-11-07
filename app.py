@@ -479,7 +479,7 @@ if run_button:
                 if 'Capital Expenditures' in cash_flow.index:
                     cap_ex = safe_float(cash_flow.loc['Capital Expenditures'].iloc[0])
 
-                fcf = op_cash + cap_ex
+                fcf = op_cash - cap_ex
 
             if fcf == 0:
                  st.warning("Could not find TTM Free Cash Flow data. DCF result will be zero.")
