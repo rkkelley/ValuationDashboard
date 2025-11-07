@@ -339,7 +339,12 @@ g_rate_2_percent = st.sidebar.slider(
     help="The FCF growth rate for the second (medium-term) stage."
 )
 t_rate_percent = st.sidebar.slider(
-    "Perpetual Growth Rate (Terminal):", 1, 5, 2, format="%d%%",
+    "Perpetual Growth Rate (Terminal):",
+    min_value=1.0,
+    max_value=5.0,
+    value=2.0,
+    step=0.1,
+    format="%.1f%%",
     help="The long-term growth rate of FCF after the projection period."
 )
 
@@ -365,7 +370,12 @@ wacc_percent = 0.0 # Initialize
 
 if wacc_mode == "Manual":
     wacc_percent = st.sidebar.slider(
-        "Manual WACC:", 1, 30, 10, format="%d%%",
+        "Manual WACC:",
+        min_value=1.0,
+        max_value=30.0,
+        value=10.0,
+        step=0.1,
+        format="%.1f%%",
         help="Manually set the Weighted Average Cost of Capital."
     )
 else:
