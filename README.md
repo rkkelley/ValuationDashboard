@@ -1,78 +1,60 @@
 # Financial Valuation Dashboard
 
-## Overview
+An interactive equity valuation and scenario-analysis dashboard for exploring a company’s two-stage discounted cash flow (DCF), automatic or manual WACC, reverse DCF, sensitivity analysis, and comparable-company context.
 
-This project is an interactive web application designed to perform comprehensive financial valuations of publicly traded companies. It automates key analysis tasks like Discounted Cash Flow (DCF) modeling and Comparable Company Analysis (Comps), providing insights into a stock's intrinsic value and market expectations.
+Live application: [valuationdashboard-ryankelley.streamlit.app](https://valuationdashboard-ryankelley.streamlit.app/)
 
-The tool leverages Python libraries for data fetching and analysis, with a user-friendly interface built using Streamlit. It includes advanced features like automatic WACC calculation, sensitivity analysis, and reverse DCF to assess implied growth rates.
+## Features
 
-**Live Demo URL:** [(https://valuationdashboard-ryankelley.streamlit.app/)
+- Two-stage DCF with adjustable growth rates, durations, terminal growth, debt, cash, and shares outstanding.
+- Automatic WACC using CAPM, estimated cost of debt, capital structure weights, and tax adjustment, plus a transparent manual mode.
+- Projected and discounted annual free cash flows, enterprise value, equity value, implied share price, and terminal-value contribution.
+- WACC/terminal-growth sensitivity heatmap and reverse DCF for the Stage 1 growth rate implied by the current price.
+- Comparable-company table with normalized tickers, missing-value handling, and per-ticker failure isolation.
+- Live company and financial statement data from Yahoo Finance with labeled fallbacks for important inputs.
 
----
+## Valuation methodology
 
-## Key Features
+The model sums the latest four quarterly free cash flow values when available, or calculates operating cash flow less capital expenditures using alternate Yahoo Finance labels. It projects FCF through Stage 1 and Stage 2, discounts each forecast year and the Gordon-growth terminal value using WACC, and adjusts enterprise value for debt and cash.
 
-* **Interactive Interface:** Built with Streamlit for easy input and visualization.
-* **Data Fetching:** Pulls real-time stock data, company info, and financials using `yfinance`.
-* **2-Stage DCF Model:** Performs a 10-year Discounted Cash Flow valuation with user-adjustable growth assumptions (Years 1-5 and 6-10) and a terminal value.
-* **WACC Calculation:**
-    * **Automatic Mode:** Calculates Weighted Average Cost of Capital (WACC) using CAPM (Cost of Equity based on Beta, Risk-Free Rate, ERP) and Cost of Debt (estimated from financials).
-    * **Manual Mode:** Allows users to input their own WACC.
-* **Comparable Company Analysis (Comps):** Displays key financial metrics and valuation multiples (P/E, P/S, EV/Revenue, EV/EBITDA, Margins, Growth) for the target company and user-defined peers in a highlighted table.
-* **Sensitivity Analysis:** Visualizes how the Implied Share Price changes based on variations in WACC and the Terminal Growth Rate using an interactive Plotly heatmap.
-* **Reverse DCF:** Calculates the implied short-term (Years 1-5) FCF growth rate required to justify the current market stock price, given the other DCF assumptions.
-* **Robust Data Handling:** Includes error checks and fallbacks for missing or inconsistent data from the `yfinance` API.
+Automatic WACC uses CAPM for cost of equity and estimates pretax cost of debt from interest expense divided by debt when those fields are available. Missing or unstable inputs are labeled in the dashboard and may cause a clearly identified fallback.
 
----
+## Technology stack
 
-## Technologies Used
+Python, Streamlit, yfinance, Pandas, NumPy, and Plotly.
 
-* **Python:** Core programming language.
-* **Streamlit:** Web application framework.
-* **yfinance:** API for fetching stock data from Yahoo Finance.
-* **Pandas:** Data manipulation and analysis.
-* **Plotly:** Interactive visualizations (Sensitivity Analysis heatmap).
-* **NumPy / math:** Numerical operations and handling special values (NaN/inf).
+## Project structure
 
----
+~~~
+app.py                    Streamlit layout, inputs, and presentation
+valuation.py              Pure DCF, WACC, sensitivity, and reverse-DCF logic
+data_service.py           Yahoo Finance retrieval and data normalization
+tests/test_valuation.py   Deterministic model tests
+~~~
 
-## Demo
+## Local setup
 
+~~~
+git clone https://github.com/rkkelley/ValuationDashboard.git
+cd ValuationDashboard
+python -m venv .venv
+# macOS/Linux: source .venv/bin/activate
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+streamlit run app.py
+~~~
 
+## Testing
 
-https://github.com/user-attachments/assets/6bbe30ea-a36b-4501-b677-6608a3151299
+~~~
+pytest -q
+python -m pytest -q
+python -m compileall .
+~~~
 
+The valuation tests are deterministic and do not require internet access. Live Yahoo Finance responses are intentionally not part of the test suite.
 
-A brief walkthrough showing the main features: entering a ticker, adjusting DCF assumptions, viewing the Comps table, and interpreting the Sensitivity Analysis and Reverse DCF.
+## Limitations and educational-use disclaimer
 
----
-
-## Installation & Usage
-
-To run this application locally:
-
-1.  **Clone the repository:**
-    ```bash
-    git clone [https://github.com/](https://github.com/)<your-github-username>/<repo-name>.git
-    cd <repo-name>
-    ```
-2.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Make sure your `requirements.txt` file lists `streamlit`, `yfinance`, `pandas`, `plotly`, `numpy`)*
-3.  **Run the Streamlit app:**
-    ```bash
-    streamlit run app.py 
-    ```
-    The application will open in your default web browser.
-
----
-
-## (Optional) Future Enhancements
-
-* Integration with a more robust financial data API (e.g., FMP, EODHD) for greater data reliability.
-* Addition of historical financial trends charts (Revenue, EPS, FCF over time).
-* Monte Carlo simulation for DCF outputs.
-* Saving/loading user assumptions.
-* More sophisticated fallback logic for missing data points.
+Yahoo Finance data may be delayed, revised, incomplete, or inconsistent between issuers. DCF outputs are highly sensitive to growth, WACC, terminal growth, and the quality of the underlying FCF data. Comparable-company multiples provide market context rather than a standalone valuation conclusion. This project is for educational and analytical use only and is not investment advice or a recommendation to buy or sell securities.

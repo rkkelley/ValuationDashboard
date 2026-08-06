@@ -1,817 +1,552 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
+"""Streamlit interface for the Financial Valuation Dashboard."""
+
+from __future__ import annotations
+
 import math
-import numpy as np # For infinity check
-import plotly.express as px
+
+import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
+
+from data_service import (
+    DataFetchError,
+    fetch_company_data,
+    get_comps_data,
+    get_risk_free_rate,
+    normalize_metrics,
+    parse_peer_tickers,
+)
+from valuation import (
+    DEFAULT_FALLBACK_WACC,
+    DCFResult,
+    WACCResult,
+    calculate_dcf,
+    calculate_wacc,
+    reverse_dcf,
+)
 
 
-# --- Page Configuration ---
 st.set_page_config(
-    page_title="Valuation Dashboard",
+    page_title="Financial Valuation Dashboard",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# --- Robust Helper Function (Catches str, None, nan, inf) ---
-def safe_float(value):
-    """Converts a value to float, returning 0.0 if it fails or is inf/nan."""
+st.markdown(
+    """
+    <style>
+        .block-container { padding-top: 2.25rem; padding-bottom: 3rem; }
+        [data-testid="stMetricValue"] { font-size: 1.55rem; }
+        .section-kicker {
+            color: #6b7280; font-size: .74rem; font-weight: 700;
+            letter-spacing: .11em; text-transform: uppercase; margin-bottom: -.55rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def format_currency(value: object, decimals: int = 2) -> str:
     if value is None:
-        return 0.0
-    try:
-        f_val = float(value)
-        # Check if the value is 'Not a Number' (nan) or infinity
-        if math.isnan(f_val) or math.isinf(f_val):
-            return 0.0
-        return f_val
-    except (ValueError, TypeError, AttributeError):
-        return 0.0
-    
-
-def format_number(value, decimals=2, is_dollar=True, is_shares=False):
-    """Formats a number safely with commas and specified decimals."""
-    cleaned_value = safe_float(value) # Use safe_float first
-
-    # Handle zero/invalid values
-    if cleaned_value == 0.0 and (value != 0 or not isinstance(value, (int, float))):
         return "N/A"
-    if cleaned_value == 0.0 and value == 0:
-        return "$0.00" if is_dollar else ("0" if is_shares else "0.00")
-
-
     try:
-        if is_shares:
-            # Format shares as integer with commas
-            return f"{cleaned_value:,.0f}"
-        else:
-            # Format currency or general number
-            prefix = "$" if is_dollar else ""
-            return f"{prefix}{cleaned_value:,.{decimals}f}"
-    except (ValueError, TypeError):
-        return "N/A (Format Error)"
-
-# --- Helper Function for Comps (Uses safe_float) ---
-@st.cache_data(ttl=600)
-def get_comps_data(tickers):
-    """Pulls key metrics for a list of competitor tickers."""
-    data = []
-    for ticker in tickers:
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
-
-            metrics = {
-                "Ticker": ticker,
-                "Company Name": info.get('shortName', 'N/A'),
-                "Market Cap (B)": safe_float(info.get('marketCap')) / 1e9,
-                "Revenue Growth (TTM)": safe_float(info.get('revenueGrowth')),
-                "Gross Margin (TTM)": safe_float(info.get('grossMargins')),
-                "EBITDA Margin (TTM)": safe_float(info.get('ebitdaMargins')),
-                "P/E (Forward)": safe_float(info.get('forwardPE')),
-                "P/S (TTM)": safe_float(info.get('priceToSalesTrailing12Months')), # Corrected P/S
-                "EV/Revenue (TTM)": safe_float(info.get('enterpriseToRevenue')),
-                "EV/EBITDA (TTM)": safe_float(info.get('enterpriseToEbitda'))
-            }
-            data.append(metrics)
-        except Exception as e:
-            st.warning(f"Could not pull data for {ticker}. Skipping. Error: {e}")
-
-    column_order = [
-        "Company Name", "Market Cap (B)",
-        "Revenue Growth (TTM)", "Gross Margin (TTM)", "EBITDA Margin (TTM)",
-        "P/E (Forward)", "P/S (TTM)", "EV/Revenue (TTM)", "EV/EBITDA (TTM)"
-    ]
-
-    df = pd.DataFrame(data).set_index("Ticker")
-    df = df.reindex(columns=column_order, fill_value=0.0)
-    return df
-
-# --- Helper Function for WACC (Uses safe_float) ---
-# --- Helper Function for WACC (Uses safe_float AND better Rd fallback) ---
-# @st.cache_data(ttl=600)
-def get_wacc_components(_stock, _financials, _balance_sheet, rf_rate, erp, tax_rate):
-    """Calculates the components of WACC with improved Rd fallback."""
-    info = _stock.info
-
-    beta = safe_float(info.get('beta', 1.0))
-    if beta == 0.0: beta = 1.0
-    cost_of_equity = rf_rate + beta * erp
-
-    # --- Improved Cost of Debt (Rd) Calculation ---
-    total_debt = 0.0
-    # Try multiple keys for debt
-    if 'Total Debt' in _balance_sheet.index:
-        total_debt = safe_float(_balance_sheet.loc['Total Debt'].iloc[0])
-    elif 'longTermDebt' in info and info['longTermDebt'] is not None:
-         total_debt = safe_float(info['longTermDebt'])
-    elif 'Long Term Debt' in _balance_sheet.index:
-         total_debt = safe_float(_balance_sheet.loc['Long Term Debt'].iloc[0])
-
-    interest_expense = 0.0
-    # Try multiple keys for interest expense
-    if 'Interest Expense' in _financials.index:
-        interest_expense = abs(safe_float(_financials.loc['Interest Expense'].iloc[0]))
-    elif 'interestExpense' in info and info['interestExpense'] is not None:
-         interest_expense = abs(safe_float(info['interestExpense']))
-
-    # Default Rd assumption: Risk-Free Rate + 1.5% Spread
-    cost_of_debt_fallback = rf_rate + 0.015
-    cost_of_debt = cost_of_debt_fallback # Start with fallback
-
-    if total_debt > 0 and interest_expense > 0:
-        try:
-            calculated_rd = interest_expense / total_debt
-            calculated_rd = min(calculated_rd, 0.20) # Cap at 20%
-
-            # **NEW FALLBACK LOGIC:** Only use calculated Rd if it's reasonable (>= rf_rate)
-            if calculated_rd >= rf_rate:
-                cost_of_debt = calculated_rd
-            else:
-                # If calculated Rd is too low, keep the fallback but log a warning (optional)
-                print(f"Warning: Calculated Rd ({calculated_rd:.2%}) for {info.get('symbol', '')} is below Rf ({rf_rate:.2%}). Using fallback Rd {cost_of_debt_fallback:.2%}.")
-                cost_of_debt = cost_of_debt_fallback # Explicitly ensure fallback is used
-
-        except ZeroDivisionError:
-             pass # Keep the initial fallback if division fails
-    # --- End Improved Rd Calculation ---
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    return f"${number:,.{decimals}f}" if math.isfinite(number) else "N/A"
 
 
-    market_cap = safe_float(info.get('marketCap'))
-    total_value = market_cap + total_debt
+def format_large_currency(value: object) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not math.isfinite(number):
+        return "N/A"
+    absolute = abs(number)
+    if absolute >= 1e12:
+        return f"${number / 1e12:,.2f}T"
+    if absolute >= 1e9:
+        return f"${number / 1e9:,.2f}B"
+    if absolute >= 1e6:
+        return f"${number / 1e6:,.2f}M"
+    return format_currency(number, 0)
 
-    if total_value == 0.0:
-        weight_equity = 1.0
-        weight_debt = 0.0
+
+def format_percent(value: object, decimals: int = 1, signed: bool = False) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not math.isfinite(number):
+        return "N/A"
+    sign = "+" if signed and number > 0 else ""
+    return f"{sign}{number:.{decimals}%}"
+
+
+def display_value(value: object, formatter=format_currency) -> str:
+    return formatter(value) if value is not None else "N/A"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_comps(tickers: tuple[str, ...]):
+    return get_comps_data(tickers)
+
+
+def manual_wacc_result(value: float) -> WACCResult:
+    return WACCResult(valid=True, wacc=value, fallback_used=False)
+
+
+def render_wacc_details(result: WACCResult, mode: str, source_fallbacks: list[str]) -> None:
+    st.markdown('<div class="section-kicker">Discount rate</div>', unsafe_allow_html=True)
+    st.subheader("WACC assumptions")
+    if mode == "Manual":
+        st.info(f"Manual WACC selected: **{format_percent(result.wacc)}**")
+        return
+
+    values = {
+        "Risk-free rate": format_percent(result.risk_free_rate),
+        "Beta": f"{result.beta:.2f}" if result.beta is not None else "N/A",
+        "Equity risk premium": format_percent(result.equity_risk_premium),
+        "Cost of equity": format_percent(result.cost_of_equity),
+        "Cost of debt": format_percent(result.cost_of_debt),
+        "Equity weight": format_percent(result.equity_weight),
+        "Debt weight": format_percent(result.debt_weight),
+        "Tax rate": format_percent(result.tax_rate),
+        "Final WACC": format_percent(result.wacc),
+    }
+    details = pd.DataFrame([values]).T.rename(columns={0: "Value"})
+    st.dataframe(details, use_container_width=True, hide_index=False)
+    notes = list(result.fallback_notes) + source_fallbacks
+    if result.fallback_used or source_fallbacks:
+        st.caption("Fallbacks used: " + " ".join(dict.fromkeys(notes)) if notes else "Fallback WACC used.")
     else:
-        weight_equity = market_cap / total_value
-        weight_debt = total_debt / total_value
-
-    wacc = (weight_equity * cost_of_equity) + (weight_debt * cost_of_debt * (1 - tax_rate))
-    wacc = max(0.01, min(wacc, 0.30)) # Ensure WACC is within bounds
-
-    return wacc, cost_of_equity, cost_of_debt, beta, rf_rate, erp
+        st.caption("All displayed WACC components came from the selected inputs and available company data.")
 
 
-# --- NEW: Helper Function for Sensitivity Analysis ---
-def calculate_dcf_price(fcf, g_rate_1, g_rate_2, t_rate, wacc, shares_outstanding, total_debt, cash, duration_1=5, duration_2=5):
-    """Recalculates DCF Implied Price for given assumptions."""
-    try:
-        # --- Basic Validations ---
-        if any(pd.isna(x) or x <= 0 for x in [fcf, shares_outstanding]) or wacc <= 0:
-            return np.nan
-
-        # Prevent unrealistic scenario: WACC too close or below terminal growth
-        if wacc - t_rate < 0.005:  # at least 0.5% spread
-            return np.nan
-
-        # --- 1. Project FCF for 10 years ---
-        total_duration = duration_1 + duration_2 # ADDED
-        projected_fcf = []
-        fcf_year = fcf
-        for year in range(1, total_duration + 1): # CHANGED
-            # First N years: higher growth, next M years: moderate growth
-            growth = g_rate_1 if year <= duration_1 else g_rate_2 # CHANGED
-            fcf_year *= (1 + growth)
-            projected_fcf.append(fcf_year)
-
-        # --- 2. Calculate Terminal Value ---
-        terminal_value = projected_fcf[-1] * (1 + t_rate) / (wacc - t_rate)
-
-        # --- 3. Discount All Cash Flows ---
-        discounted_fcf = [
-            projected_fcf[i] / ((1 + wacc) ** (i + 1)) for i in range(total_duration) # CHANGED
-        ]
-        discounted_tv = terminal_value / ((1 + wacc) ** total_duration) # CHANGED
-
-        # --- 4. Enterprise Value ---
-        enterprise_value = sum(discounted_fcf) + discounted_tv
-
-        # --- 5. Equity Value ---
-        equity_value = enterprise_value - total_debt + cash
-
-        # --- 6. Implied Price ---
-        implied_price = equity_value / shares_outstanding
-
-        # --- 7. Cap unrealistic results ---
-        # if implied_price > 500:
-        #     implied_price = np.nan
-        return safe_float(implied_price)
-    
-    except Exception as e:
-        print(f"Error in calculate_dcf_price: {e}")
-        return np.nan
-    
-
-@st.cache_data(ttl=600)
-# --- Reverse DCF Helper Function ---
-def reverse_dcf(current_price, fcf, g_rate_2, t_rate, wacc, shares_outstanding, total_debt, cash, duration_1=5, duration_2=5):
-    """
-    Calculate the implied short-term growth rate (g_rate_1) required to justify current_price.
-    Uses binary search.
-    """
-    # Ensure inputs are valid floats
-    current_price = safe_float(current_price)
-    fcf = safe_float(fcf)
-    g_rate_2 = safe_float(g_rate_2)
-    t_rate = safe_float(t_rate)
-    wacc = safe_float(wacc)
-    shares_outstanding = safe_float(shares_outstanding)
-    total_debt = safe_float(total_debt)
-    cash = safe_float(cash)
-
-    # Basic validation
-    if fcf <= 0 or shares_outstanding <= 0 or wacc <= t_rate or current_price <= 0:
-        print(f"Reverse DCF Input Validation Failed: fcf={fcf}, shares={shares_outstanding}, wacc={wacc}, t_rate={t_rate}, price={current_price}")
-        return None # Return None for invalid base inputs
-
-    target_ev = current_price * shares_outstanding + total_debt - cash
-    if target_ev <= 0: # Target EV must be positive for binary search to work logically
-        print(f"Reverse DCF Target EV Calculation Failed or Non-positive: target_ev={target_ev}")
-        return None
-
-    total_duration = duration_1 + duration_2 # ADDED
-
-    # Binary search for g_rate_1
-    low, high = -0.50, 2.00  # Allow negative growth up to 200% growth
-    implied_rate = None
-
-    for iteration in range(100):  # Max 100 iterations for convergence
-        mid = (low + high) / 2
-
-        # --- Recalculate EV based on 'mid' as g_rate_1 ---
-        try: # Add try-except for potential math errors in projection
-            projected_fcf = []
-            last_fcf = fcf
-            # Stage 1: High growth using 'mid' rate
-            for _ in range(duration_1): # CHANGED
-                last_fcf *= (1 + mid)
-                projected_fcf.append(last_fcf)
-            # Stage 2: Stable growth using g_rate_2
-            for _ in range(duration_2): # CHANGED
-                last_fcf *= (1 + g_rate_2)
-                projected_fcf.append(last_fcf)
-
-            # Clean projected FCF list and check validity
-            projected_fcf = [safe_float(val) for val in projected_fcf]
-            if not projected_fcf or projected_fcf[-1] == 0 or any(math.isinf(f) or math.isnan(f) for f in projected_fcf):
-                # If projection fails or leads to non-finite numbers, adjust search range
-                # print(f"Iter {iteration}: Invalid FCF projection for mid={mid:.4f}. Adjusting range.")
-                if mid > 0 : high = mid # If positive growth failed, try lower
-                else: low = mid      # If negative growth failed, try higher (less negative)
-                continue # Skip rest of loop for this iteration
-
-
-            terminal_value = (projected_fcf[-1] * (1 + t_rate)) / (wacc - t_rate)
-            terminal_value = safe_float(terminal_value) # Clean (handles potential inf/nan)
-
-            discounted_values = [fcf_year / (1 + wacc)**(i + 1) for i, fcf_year in enumerate(projected_fcf)]
-            discounted_values = [safe_float(val) for val in discounted_values] # Clean
-
-            discounted_terminal_value = terminal_value / (1 + wacc)**(total_duration) # CHANGED
-            discounted_terminal_value = safe_float(discounted_terminal_value) # Clean
-
-            enterprise_value = sum(discounted_values) + discounted_terminal_value
-            enterprise_value = safe_float(enterprise_value) # Clean
-
-            # If EV calculation results in 0 (e.g., due to extreme safe_float cleaning), treat as failure
-            if enterprise_value == 0:
-                # print(f"Iter {iteration}: Calculated EV is zero for mid={mid:.4f}. Adjusting range.")
-                # This likely means the growth rate 'mid' combined with wacc leads to issues
-                # Adjust based on whether we are trying to increase or decrease EV
-                if low < mid : high = mid # If EV was likely too high and got cleaned to 0, reduce upper bound
-                else: low = mid        # If EV was likely too low/negative, increase lower bound
-                continue
-
-
-        except (OverflowError, ValueError, ZeroDivisionError) as e_calc:
-             # print(f"Iter {iteration}: Calculation Error for mid={mid:.4f}: {e_calc}. Adjusting range.")
-             # If calculation fails, assume 'mid' growth rate was too extreme
-             if mid > 0 : high = mid # Try lower rates
-             else: low = mid      # Try higher rates (less negative)
-             continue # Skip comparison for this iteration
-
-
-        # --- Binary Search Logic ---
-        # Check if calculated EV is close enough to target EV
-        tolerance = target_ev * 0.001 # 0.1% tolerance
-        if abs(enterprise_value - target_ev) < tolerance:
-            implied_rate = mid
-            # print(f"Converged at iteration {iteration} with rate {implied_rate:.4f}")
-            break
-        elif enterprise_value < target_ev:
-            low = mid # Need higher growth, increase lower bound
-        else:
-            high = mid # Need lower growth, decrease upper bound
-
-        # Break if range is too small (indicates convergence or unable to converge)
-        if abs(high - low) < 1e-6:
-             implied_rate = mid # Converged enough, or best estimate
-             # print(f"Range too small at iteration {iteration}. Best rate {implied_rate:.4f}")
-             break
-
-    # Final check on the validity of the found rate
-    if implied_rate is not None and -0.50 <= implied_rate <= 2.00:
-        return implied_rate
-    else:
-        # print(f"Failed to converge or result out of bounds. Final mid: {mid}, low: {low}, high: {high}")
-        return None # Return None if no suitable rate found
-
-
-# --- Sidebar ---
-st.sidebar.header("User Inputs")
-ticker = st.sidebar.text_input("Stock Ticker", "AAPL").upper()
-run_button = st.sidebar.button("Run Analysis")
-
-# --- DCF Assumptions ---
-st.sidebar.subheader("DCF Assumptions")
-st.sidebar.markdown("""
-* **High-growth (e.g., NVDA):** Use high short-term growth (20-50%).
-* **Mature (e.g., XOM):** Use low, stable growth (2-8%).
-""")
-
-g_rate_1_percent = st.sidebar.slider(
-    "Growth Rate (Stage 1):", 1, 50, 30, format="%d%%",
-    help="The expected FCF growth rate for the first (short-term) stage."
-)
-g_rate_2_percent = st.sidebar.slider(
-    "Growth Rate (Stage 2):", 1, 20, 10, format="%d%%",
-    help="The FCF growth rate for the second (medium-term) stage."
-)
-t_rate_percent = st.sidebar.slider(
-    "Perpetual Growth Rate (Terminal):",
-    min_value=1.0,
-    max_value=5.0,
-    value=2.0,
-    step=0.1,
-    format="%.1f%%",
-    help="The long-term growth rate of FCF after the projection period."
-)
-
-# --- NEW: Duration Sliders ---
-st.sidebar.markdown("---")
-st.sidebar.markdown("**DCF Duration (Years)**")
-duration_1 = st.sidebar.slider(
-    "Short-Term Growth Duration (Stage 1):", 1, 10, 5, format="%d years",
-    help="The number of years for the short-term (Stage 1) growth rate."
-)
-duration_2 = st.sidebar.slider(
-    "Medium-Term Growth Duration (Stage 2):", 1, 10, 5, format="%d years",
-    help="The number of years for the medium-term (Stage 2) growth rate."
-)
-# --- End New ---
-
-
-# --- WACC Calculation Section ---
-st.sidebar.subheader("Discount Rate (WACC)")
-wacc_mode = st.sidebar.radio("WACC Mode", ["Automatic", "Manual"], index=0, help="Choose 'Automatic' to calculate WACC based on market data (CAPM) or 'Manual' to set it yourself.")
-
-wacc_percent = 0.0 # Initialize
-
-if wacc_mode == "Manual":
-    wacc_percent = st.sidebar.slider(
-        "Manual WACC:",
-        min_value=1.0,
-        max_value=30.0,
-        value=10.0,
-        step=0.1,
-        format="%.1f%%",
-        help="Manually set the Weighted Average Cost of Capital."
-    )
-else:
-    st.sidebar.markdown("**WACC Auto-Calculation Inputs:**")
-    erp_percent = st.sidebar.slider(
-        "Equity Risk Premium (ERP):", 3.0, 10.0, 5.5, step=0.1, format="%.1f%%",
-        help="The excess return that investing in the stock market provides over a risk-free rate. (Default: 5.5%)"
-    )
-    tax_rate_percent = st.sidebar.slider(
-        "Effective Tax Rate:", 0, 50, 21, format="%d%%",
-        help="The company's effective corporate tax rate. (Default: 21%)"
+def render_sensitivity(
+    fcf: float,
+    stage_1_growth: float,
+    stage_2_growth: float,
+    terminal_growth: float,
+    wacc: float,
+    shares: float,
+    debt: float,
+    cash: float,
+    duration_1: int,
+    duration_2: int,
+) -> None:
+    st.markdown('<div class="section-kicker">Scenario analysis</div>', unsafe_allow_html=True)
+    st.subheader("WACC and terminal-growth sensitivity")
+    st.caption(
+        "Each cell calls the same two-stage DCF used for the base case. "
+        "Cells without a safe WACC-to-terminal-growth spread are shown as unavailable."
     )
 
-# --- Comps Tickers Input ---
-st.sidebar.subheader("Comparable Companies")
-peers_input = st.sidebar.text_input(
-    "Competitor Tickers (comma-separated):", "MSFT, GOOG, META, AMZN"
-)
+    wacc_values = sorted({max(0.01, wacc + offset) for offset in (-0.01, -0.005, 0, 0.005, 0.01)})
+    terminal_values = sorted({max(-0.01, terminal_growth + offset) for offset in (-0.005, -0.0025, 0, 0.0025, 0.005)})
+    wacc_labels = [format_percent(value, 2) for value in wacc_values]
+    terminal_labels = [format_percent(value, 2) for value in terminal_values]
+    prices: list[list[float]] = []
+    cell_text: list[list[str]] = []
+    for scenario_wacc in wacc_values:
+        row: list[float] = []
+        text_row: list[str] = []
+        for scenario_terminal in terminal_values:
+            result = calculate_dcf(
+                fcf,
+                stage_1_growth,
+                stage_2_growth,
+                scenario_terminal,
+                scenario_wacc,
+                shares,
+                debt,
+                cash,
+                duration_1,
+                duration_2,
+            )
+            price = result.implied_share_price if result.valid else np.nan
+            row.append(price if price is not None else np.nan)
+            label = format_currency(price)
+            if abs(scenario_wacc - wacc) < 1e-9 and abs(scenario_terminal - terminal_growth) < 1e-9:
+                label = f"★ {label}"
+            text_row.append(label)
+        prices.append(row)
+        cell_text.append(text_row)
 
-# --- Main Page Title ---
-st.title(f"Financial Valuation Dashboard: {ticker}")
-
-# --- App Logic ---
-if run_button:
-
-    g_rate_1 = g_rate_1_percent / 100.0
-    g_rate_2 = g_rate_2_percent / 100.0
-    t_rate = t_rate_percent / 100.0
-    # Durations are used directly as integers (duration_1, duration_2)
-
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        try: financials = stock.financials
-        except Exception: financials = pd.DataFrame()
-        try: balance_sheet = stock.balance_sheet
-        except Exception: balance_sheet = pd.DataFrame()
-        try: cash_flow = stock.cashflow
-        except Exception: cash_flow = pd.DataFrame()
-
-
-        # --- WACC Calculation Logic ---
-        wacc = 0.0
-        re = 0.0; rd = 0.0; beta = 0.0; rf = 0.0; erp_val = 0.0
-
-        if wacc_mode == "Manual":
-            wacc = wacc_percent / 100.0
-        else:
-            try:
-                rf_stock = yf.Ticker("^TNX")
-                rf_rate_raw = rf_stock.info.get('regularMarketPrice') or rf_stock.info.get('previousClose')
-                rf_rate = safe_float(rf_rate_raw) / 100.0
-                if rf_rate == 0.0: rf_rate = 0.04
-            except Exception:
-                rf_rate = 0.04
-
-            erp = erp_percent / 100.0
-            tax_rate = tax_rate_percent / 100.0
-
-            if not financials.empty and not balance_sheet.empty:
-                 wacc, re, rd, beta, rf, erp_val = get_wacc_components(stock, financials, balance_sheet, rf_rate, erp, tax_rate)
-            else:
-                 st.warning("Could not retrieve necessary financial data for WACC calculation. Using fallback WACC of 10%.")
-                 wacc = 0.10
-
-            with st.sidebar.expander("View Auto-WACC Details", expanded=True):
-                st.write(f"Risk-Free Rate (10-Yr): {rf_rate:.2%}") # Use rf_rate directly
-                st.write(f"Equity Risk Premium: {erp:.2%}") # Use erp directly
-                st.write(f"Company Beta: {beta:.2f}")
-                st.write(f"Cost of Equity (Re): {re:.2%}")
-                st.write(f"Cost of Debt (Rd): {rd:.2%}")
-                st.write(f"Effective Tax Rate: {tax_rate:.2%}")
-                st.markdown(f"**Calculated WACC: {wacc:.2%}**")
+    figure = go.Figure(
+        data=go.Heatmap(
+            z=prices,
+            x=terminal_labels,
+            y=wacc_labels,
+            text=cell_text,
+            texttemplate="%{text}",
+            colorscale="RdYlGn",
+            hovertemplate="WACC: %{y}<br>Terminal growth: %{x}<br>Implied price: $%{z:,.2f}<extra></extra>",
+            colorbar={"title": "Price ($)"},
+            hoverongaps=False,
+        )
+    )
+    figure.update_layout(
+        height=430,
+        margin={"l": 10, "r": 10, "t": 20, "b": 20},
+        xaxis_title="Terminal growth",
+        yaxis_title="WACC",
+        yaxis={"autorange": "reversed"},
+    )
+    st.plotly_chart(figure, use_container_width=True)
+    st.caption(
+        f"★ Base case: WACC {format_percent(wacc, 2)}, terminal growth {format_percent(terminal_growth, 2)}. "
+        "Prices are scenario outputs, not investment recommendations."
+    )
 
 
-        # Display Basic Info
-        st.subheader(f"Company Profile: {info.get('longName', 'N/A')}")
-        st.markdown(f"**Sector:** {info.get('sector', 'N/A')}")
-        st.markdown(f"**Industry:** {info.get('industry', 'N/A')}")
-        st.markdown(f"**Website:** {info.get('website', 'N/A')}")
-
-        with st.expander("View Company Summary"):
-            st.write(info.get('longBusinessSummary', 'No summary available.'))
-
-        # --- DCF Valuation ---
-        st.subheader("Discounted Cash Flow (DCF) Valuation")
-        st.write(f"Using Discount Rate (WACC): **{wacc:.2%}**")
-        st.write(f"Projection: **{duration_1}** years (Stage 1) + **{duration_2}** years (Stage 2) = **{duration_1 + duration_2}** total years.")
-
-
-        # Get FCF
-        fcf = 0.0
-        try:
-            # --- New FCF Calculation Logic: TTM from Quarterly Statements ---
-
-            # 1. Fetch the quarterly cash flow statement. Use .T to transpose for easier reading.
-            quarterly_cf = stock.get_cashflow(freq="quarterly").T
-
-            if quarterly_cf.empty:
-                st.warning("Could not fetch quarterly cash flow data. DCF result will be zero.")
-                # fcf remains 0.0
-            
-            # Check for the existence of the reliable FreeCashFlow column
-            elif 'FreeCashFlow' in quarterly_cf.columns:
-                
-                # 2. Sum the FreeCashFlow column for the last 4 quarters (TTM)
-                # .head(4) gets the last four reported quarters
-                ttm_fcf_series = quarterly_cf.head(4)['FreeCashFlow']
-                
-                # .sum() calculates the Trailing Twelve Months figure
-                fcf = ttm_fcf_series.sum()
-                
-                # The sum should be $4,130,000,000.00 for GD if the latest quarters are Q2'25, Q1'25, Q4'24, Q3'24
-                
-                if fcf == 0:
-                    st.warning("TTM FCF calculated as zero. Check quarterly data for missing values.")
-
-            else:
-                # Fallback if the FreeCashFlow column name changes or is missing
-                st.warning("FreeCashFlow column not found. Attempting manual OpCash - CapEx calculation.")
-                
-                    # If the direct FCF column fails, you'd implement the OpCash - CapEx fallback here
-                    # This fallback is complex due to changing column names and is best avoided if possible.
-                    
-        except Exception as e:
-            st.error(f"Error calculating TTM FCF: {e}")
-                # fcf remains 0.0
-
-        # Initialize DCF variables outside the 'if fcf > 0' block
-        total_duration = duration_1 + duration_2 # ADDED
-        projected_fcf = [0.0] * total_duration # CHANGED
-        discounted_values = [0.0] * total_duration # CHANGED
-        terminal_value = 0.0
-        discounted_terminal_value = 0.0
-        enterprise_value = 0.0
-        equity_value = 0.0
-        implied_share_price = 0.0
-
-        if fcf > 0:
-            # 1. Project FCF
-            temp_projected_fcf = [] # Use a temporary list
-            last_fcf = fcf
-            for i in range(1, duration_1 + 1): last_fcf *= (1 + g_rate_1); temp_projected_fcf.append(last_fcf) # CHANGED
-            for i in range(1, duration_2 + 1): last_fcf *= (1 + g_rate_2); temp_projected_fcf.append(last_fcf) # CHANGED
-            # --- NEW: Clean projected_fcf list ---
-            projected_fcf = [safe_float(val) for val in temp_projected_fcf]
+def render_comps(ticker: str, peers_input: str) -> None:
+    st.markdown('<div class="section-kicker">Market context</div>', unsafe_allow_html=True)
+    st.subheader("Comparable companies")
+    tickers = parse_peer_tickers(peers_input, ticker)
+    comps_df, skipped = load_comps(tuple(tickers))
+    if skipped:
+        st.caption("Skipped unavailable ticker(s): " + ", ".join(skipped))
+    if comps_df.empty:
+        st.info("Comparable-company data was unavailable for the selected tickers.")
+        return
+    formatters = {
+        "Market Cap (B)": "${:,.2f}B",
+        "Revenue Growth (TTM)": "{:.1%}",
+        "Gross Margin (TTM)": "{:.1%}",
+        "EBITDA Margin (TTM)": "{:.1%}",
+        "P/E (Forward)": "{:.2f}x",
+        "P/S (TTM)": "{:.2f}x",
+        "EV/Revenue (TTM)": "{:.2f}x",
+        "EV/EBITDA (TTM)": "{:.2f}x",
+    }
+    st.dataframe(
+        comps_df.style.format(formatters, na_rep="N/A"),
+        use_container_width=True,
+        height=min(520, 90 + 36 * len(comps_df)),
+    )
 
 
-            # 2. Calculate Terminal Value
-            if wacc <= t_rate:
-                st.error("WACC must be greater than the Perpetual Growth Rate. DCF cannot be calculated.")
-                # Keep values at 0
-            else:
-                # Ensure last projected FCF is valid before calculating terminal value
-                last_valid_fcf = projected_fcf[-1] if projected_fcf else 0.0
-                if last_valid_fcf > 0:
-                     terminal_value = (last_valid_fcf * (1 + t_rate)) / (wacc - t_rate)
-                     terminal_value = safe_float(terminal_value) # Clean terminal value
+def render_methodology() -> None:
+    st.markdown('<div class="section-kicker">Reference</div>', unsafe_allow_html=True)
+    st.subheader("Methodology and limitations")
+    with st.expander("How to read this dashboard"):
+        st.markdown(
+            """
+            The model starts with trailing-twelve-month free cash flow, projects it through a higher-growth Stage 1 and a lower-growth Stage 2, and discounts those cash flows plus a Gordon-growth terminal value using WACC. Enterprise value is adjusted for debt and cash to produce equity value and an implied share price.
 
-                     # 3. Discount FCF and Terminal Value
-                     temp_discounted_values = [fcf_year / (1 + wacc)**(i + 1) for i, fcf_year in enumerate(projected_fcf)]
-                     # --- NEW: Clean discounted_values list ---
-                     discounted_values = [safe_float(val) for val in temp_discounted_values]
+            Automatic WACC uses CAPM for the cost of equity and an estimated pretax cost of debt weighted by market-value equity and debt. Missing inputs are labeled when a fallback is used. Reverse DCF solves for the Stage 1 growth rate implied by the current market price under the remaining assumptions.
 
-                     discounted_terminal_value = terminal_value / (1 + wacc)**total_duration # CHANGED
-                     discounted_terminal_value = safe_float(discounted_terminal_value) # Clean dTV
-
-                     # 4. Calculate Enterprise Value
-                     enterprise_value = sum(discounted_values) + discounted_terminal_value
-                     enterprise_value = safe_float(enterprise_value) # Clean EV
-                else:
-                    st.error("Could not project FCF. DCF cannot be calculated.")
-
-
-            # 5. Calculate Equity Value and Implied Share Price
-            try:
-                # Ensure base values are floats
-                total_debt = safe_float(info.get('totalDebt'))
-                cash = safe_float(info.get('totalCash'))
-                shares_outstanding = safe_float(info.get('sharesOutstanding'))
-                current_price = safe_float(info.get('currentPrice') or info.get('regularMarketPrice'))
-
-                st.write(f"Using TTM FCF: **${safe_float(fcf):,.2f}**") # Added safe_float here too
-
-                col1, col2 = st.columns(2)
-
-                equity_value = 0.0
-                implied_share_price = 0.0
-
-                # Ensure enterprise_value exists and is calculated
-                if 'enterprise_value' not in locals():
-                     enterprise_value = 0.0 # Initialize if WACC condition failed
-
-                if shares_outstanding > 0 and enterprise_value > 0 : # Check enterprise_value
-                    equity_value = enterprise_value - total_debt + cash
-                    equity_value = safe_float(equity_value) # Clean Equity Value
-                    implied_share_price = equity_value / shares_outstanding
-                    implied_share_price = safe_float(implied_share_price) # Clean Implied Price
-
-                    with col1:
-                        st.success(f"Implied Share Price: **${implied_share_price:,.2f}**")
-                    with col2:
-                        st.info(f"Current Share Price: **${current_price:,.2f}**")
-
-                    if implied_share_price > 0 and current_price > 0:
-                        if implied_share_price > current_price:
-                            st.write(f"**Result:** Based on this {total_duration}-year 2-stage DCF, the stock appears **Undervalued**.")
-                        else:
-                            st.write(f"**Result:** Based on this {total_duration}-year 2-stage DCF, the stock appears **Overvalued**.")
-                    else:
-                         st.warning("Cannot determine valuation due to missing price data or invalid DCF result.")
-
-                else:
-                    st.warning("Could not calculate implied share price (missing shares or invalid DCF inputs).")
-                    with col1:
-                        st.error("Implied Share Price: N/A")
-                    with col2:
-                        st.info(f"Current Share Price: **${current_price:,.2f}**")
-
-
-                # --- Display Calculation Steps Expander ---
-                with st.expander("View DCF Calculation Steps"):
-                    try:
-                        # --- Create df_fcf INSIDE the try block AFTER values are calculated ---
-                        df_fcf_display = pd.DataFrame({
-                            'Year': [f"Year {i+1}" for i in range(total_duration)], # CHANGED
-                            'Projected FCF': projected_fcf, # Use cleaned list
-                            'Discounted FCF': discounted_values # Use cleaned list
-                        })
-
-                        # --- Apply formatting safely column by column using format_number ---
-                        formatted_df = df_fcf_display.copy()
-                        for col in ['Projected FCF', 'Discounted FCF']:
-                            if col in formatted_df.columns:
-                                # Use format_number for DataFrame columns
-                                formatted_df[col] = formatted_df[col].apply(lambda x: format_number(x, decimals=2, is_dollar=True))
-
-                        st.dataframe(formatted_df) # Display the manually formatted DataFrame
-
-                        # --- Display other values safely using format_number ---
-                        st.write(f"Terminal Value (at Year {total_duration}): **{format_number(terminal_value, decimals=2, is_dollar=True)}**")
-                        st.write(f"Discounted Terminal Value: **{format_number(discounted_terminal_value, decimals=2, is_dollar=True)}**")
-                        st.write(f"Enterprise Value: **{format_number(enterprise_value, decimals=2, is_dollar=True)}**")
-                        st.write(f"Equity Value: **{format_number(equity_value, decimals=2, is_dollar=True)}** (EV - Debt + Cash)")
-                        st.write(f"Shares Outstanding: **{format_number(shares_outstanding, decimals=0, is_dollar=False, is_shares=True)}**") # Format shares
-
-                    except Exception as e_expander:
-                         st.error(f"Error displaying calculation steps: {e_expander}")
-
-            except Exception as e_price:
-                st.error(f"Error during final price display section. Debug: {e_price}")
-
-        # --- This runs if FCF <= 0 ---
-        else:
-             st.warning("Cannot run DCF: Most recent Free Cash Flow is zero or negative.")
-             # Display empty expander to avoid errors
-             with st.expander("View DCF Calculation Steps"):
-                 st.write("DCF calculation skipped due to zero or negative FCF.")
-
-
-        # --- Comparable Company Analysis ---
-        st.subheader("Comparable Company Analysis (Comps)")
-
-        peer_list = [p.strip().upper() for p in peers_input.split(',') if p.strip()]
-        all_tickers = [ticker] + peer_list
-        unique_tickers = list(dict.fromkeys(all_tickers)) # Removes duplicates
-
-        comps_df = get_comps_data(unique_tickers)
-
-        # Added formatting for new columns and corrected P/S
-        st.dataframe(comps_df.style
-            .format({
-                "Market Cap (B)": "${:,.2f}B",
-                "Revenue Growth (TTM)": "{:,.2%}",
-                "Gross Margin (TTM)": "{:,.2%}",
-                "EBITDA Margin (TTM)": "{:,.2%}",
-                "P/E (Forward)": "{:,.2f}x",
-                "P/S (TTM)": "{:,.2f}x",
-                "EV/Revenue (TTM)": "{:,.2f}x",
-                "EV/EBITDA (TTM)": "{:,.2f}x"
-            }, na_rep='N/A') # Added na_rep
-            .highlight_max(axis=0, subset=[
-                "Revenue Growth (TTM)", "Gross Margin (TTM)", "EBITDA Margin (TTM)",
-                "P/E (Forward)", "P/S (TTM)", "EV/Revenue (TTM)", "EV/EBITDA (TTM)"
-                ], color="#0DAF43")
-            .highlight_min(axis=0, subset=[
-                "Revenue Growth (TTM)", "Gross Margin (TTM)", "EBITDA Margin (TTM)",
-                "P/E (Forward)", "P/S (TTM)", "EV/Revenue (TTM)", "EV/EBITDA (TTM)"
-                ], color='#FFA0A0')
+            Results are highly sensitive to growth, WACC, terminal value, and data quality. Yahoo Finance values can be delayed, revised, incomplete, or inconsistent across issuers. Comparable-company multiples are point-in-time context and do not establish fair value. This dashboard is for educational and analytical use only, not investment advice.
+            """
         )
 
-                 # --- NEW: Sensitivity Analysis ---
-        # --- Sensitivity Analysis (Using Dictionary Approach) ---
-        st.subheader("Sensitivity Analysis (Implied Share Price $)")
-        st.caption(
-     "This table shows how the **implied share price** changes under different assumptions for the "
-     "**WACC** (discount rate) and **terminal growth rate**. "
-     "Each cell represents the fair value per share estimated by the DCF model. "
-     "Higher terminal growth or lower WACC generally lead to higher valuations."
-     )
 
-        wacc_range = [wacc - 0.01, wacc - 0.005, wacc, wacc + 0.005, wacc + 0.01]
-        t_rate_range = [t_rate - 0.005, t_rate - 0.0025, t_rate, t_rate + 0.0025, t_rate + 0.005]
+st.sidebar.title("Valuation inputs")
+ticker = st.sidebar.text_input(
+    "Stock ticker",
+    "AAPL",
+    help="Yahoo Finance symbol, for example AAPL or MSFT.",
+).strip().upper()
+run_button = st.sidebar.button("Run analysis", type="primary", use_container_width=True)
 
-        wacc_range = [max(0.01, val) for val in wacc_range]
-        t_rate_range = [max(0.001, val) for val in t_rate_range]
+with st.sidebar.expander("DCF assumptions", expanded=True):
+    stage_1_percent = st.slider(
+        "Stage 1 FCF growth",
+        min_value=-50.0,
+        max_value=100.0,
+        value=30.0,
+        step=1.0,
+        format="%.0f%%",
+        help="Annual free-cash-flow growth during the first projection stage.",
+    )
+    stage_2_percent = st.slider(
+        "Stage 2 FCF growth",
+        min_value=-20.0,
+        max_value=30.0,
+        value=10.0,
+        step=1.0,
+        format="%.0f%%",
+        help="Annual free-cash-flow growth during the second projection stage.",
+    )
+    terminal_percent = st.slider(
+        "Terminal growth",
+        min_value=-1.0,
+        max_value=5.0,
+        value=2.0,
+        step=0.1,
+        format="%.1f%%",
+        help="Perpetual growth rate after the explicit projection period.",
+    )
+    duration_1 = st.slider("Stage 1 duration", 1, 10, 5, format="%d years")
+    duration_2 = st.slider("Stage 2 duration", 1, 10, 5, format="%d years")
 
-        # Use a dictionary to store results
-        sensitivity_results = {}
+with st.sidebar.expander("Discount rate (WACC)", expanded=True):
+    wacc_mode = st.radio(
+        "WACC mode",
+        ["Automatic", "Manual"],
+        help="Automatic uses CAPM and capital structure data; Manual lets you set the discount rate directly.",
+    )
+    if wacc_mode == "Manual":
+        manual_wacc_percent = st.slider("Manual WACC", 1.0, 30.0, 10.0, 0.1, format="%.1f%%")
+        erp_percent = 5.5
+        tax_percent = 21.0
+    else:
+        manual_wacc_percent = 10.0
+        erp_percent = st.slider(
+            "Equity risk premium",
+            3.0,
+            10.0,
+            5.5,
+            0.1,
+            format="%.1f%%",
+            help="Expected market return above the risk-free rate.",
+        )
+        tax_percent = st.slider("Tax rate", 0.0, 50.0, 21.0, 1.0, format="%.0f%%")
 
-        base_fcf = safe_float(fcf)
-        base_shares = safe_float(info.get('sharesOutstanding'))
-        base_debt = safe_float(info.get('totalDebt'))
-        base_cash = safe_float(info.get('totalCash'))
+with st.sidebar.expander("Comparable companies"):
+    peers_input = st.text_input(
+        "Peer tickers",
+        "MSFT, GOOG, META, AMZN",
+        help="Comma-separated Yahoo Finance symbols.",
+    )
 
-        if base_fcf > 0 and base_shares > 0:
-            for w_sens in wacc_range:
-                # Use WACC formatted string as the key for the outer dictionary
-                w_key = f"{w_sens:.2%}"
-                sensitivity_results[w_key] = {} # Create inner dictionary for this WACC row
+stage_1_growth = stage_1_percent / 100.0
+stage_2_growth = stage_2_percent / 100.0
+terminal_growth = terminal_percent / 100.0
 
-                for t_sens in t_rate_range:
-                    # Use T-Rate formatted string as the key for the inner dictionary
-                    t_key = f"{t_sens:.2%}"
+st.title("Financial Valuation Dashboard")
+st.caption("Interactive two-stage DCF and scenario analysis using live Yahoo Finance data")
 
-                    # print(f"DEBUG Loop: Trying w_sens={w_sens:.4f}, t_sens={t_sens:.4f}") # Keep if needed
-                    if w_sens > t_sens:
-                        # Calculate price for this specific combination
-                        calculated_price = calculate_dcf_price(
-                            base_fcf, g_rate_1, g_rate_2, t_sens, w_sens,
-                            base_shares, base_debt, base_cash,
-                            duration_1, duration_2 # ADDED
-                        )
-                        # print(f"     => Price: {calculated_price:.2f}") # Keep if needed
+if not run_button:
+    st.info("Enter a ticker and select Run analysis to load the company profile, valuation, scenarios, and comps.")
+    render_methodology()
+    st.stop()
 
-                        # Assign the result to the dictionary
-                        sensitivity_results[w_key][t_key] = calculated_price
-                    else:
-                        # Assign np.nan for invalid combinations
-                        sensitivity_results[w_key][t_key] = np.nan
+try:
+    with st.spinner(f"Retrieving financial data for {ticker or 'the selected ticker'}…"):
+        company = fetch_company_data(ticker)
+        metrics = normalize_metrics(company)
+except DataFetchError as exc:
+    st.error(str(exc))
+    st.stop()
+except Exception:
+    st.error(f"The analysis could not be loaded for {ticker or 'this ticker'}. Please try again or use another symbol.")
+    st.stop()
 
-            # Convert the dictionary to a DataFrame AFTER the loops complete
-            sensitivity_df = pd.DataFrame.from_dict(sensitivity_results, orient='index')
-            sensitivity_df.index.name = "WACC"
-            sensitivity_df.columns.name = "Terminal Growth Rate"
+info = company.info
+company_name = info.get("longName") or info.get("shortName") or company.ticker
+st.markdown('<div class="section-kicker">Company overview</div>', unsafe_allow_html=True)
+st.header(f"{company_name} ({company.ticker})")
+overview_left, overview_right = st.columns([2, 1])
+with overview_left:
+    sector = info.get("sector") or "Sector unavailable"
+    industry = info.get("industry") or "Industry unavailable"
+    st.write(f"**{sector}** · {industry}")
+    summary = info.get("longBusinessSummary")
+    if summary:
+        with st.expander("Company summary"):
+            st.write(summary)
+with overview_right:
+    website = info.get("website")
+    if website:
+        st.markdown(f"[Company website]({website})")
 
-            # Melt for Plotly
-            x_labels = sensitivity_df.columns.tolist()
-            y_labels = sensitivity_df.index.tolist()
-            z_values = sensitivity_df.replace([None], np.nan).values # Use np.nan for gaps
+debt_value = metrics.total_debt.value if metrics.total_debt.value is not None else 0.0
+cash_value = metrics.cash.value if metrics.cash.value is not None else 0.0
+market_cap_value = metrics.market_cap.value
+shares_value = metrics.shares_outstanding.value
+current_price = metrics.current_price.value
+fcf_value = metrics.free_cash_flow.value
 
-            fig = go.Figure(data=go.Heatmap(
-                z=z_values,
-                x=x_labels,
-                y=y_labels,
-                colorscale='RdYlGn', # Green=High, Red=Low
-                # Custom hovertemplate to show formatted price
-                hovertemplate='WACC: %{y}<br>T. Growth: %{x}<br>Price: $%{z:,.2f}<extra></extra>',
-                # Add text to cells, formatting it manually
-                text=[[format_number(val, decimals=2, is_dollar=True) for val in row] for row in z_values],
-                texttemplate="%{text}", # Display the manually formatted text
-                showscale=True, # Show the color bar legend
-                colorbar={"title": 'Implied Share Price ($)'}
-            ))
+risk_free_point = None
+if wacc_mode == "Manual":
+    wacc_result = manual_wacc_result(manual_wacc_percent / 100.0)
+else:
+    risk_free_point = get_risk_free_rate()
+    wacc_result = calculate_wacc(
+        risk_free_point.value,
+        metrics.beta.value,
+        erp_percent / 100.0,
+        market_cap_value,
+        debt_value,
+        metrics.interest_expense.value,
+        tax_percent / 100.0,
+        fallback_wacc=DEFAULT_FALLBACK_WACC,
+    )
 
-            fig.update_layout(
-                title='DCF Sensitivity Analysis',
-                xaxis_title="Terminal Growth Rate",
-                yaxis_title="WACC",
-                # Order Y axis correctly (higher WACC at top)
-                yaxis={'categoryorder':'array', 'categoryarray': sorted(y_labels, key=lambda x: float(x.strip('%'))/100.0, reverse=True)},
-                # Order X axis correctly
-                xaxis={'categoryorder':'array', 'categoryarray': sorted(x_labels, key=lambda x: float(x.strip('%'))/100.0)}
-            )
+st.markdown('<div class="section-kicker">Primary result</div>', unsafe_allow_html=True)
+st.subheader("Valuation snapshot")
+if not wacc_result.valid or wacc_result.wacc is None:
+    st.error(wacc_result.error or "WACC could not be calculated.")
+    dcf_result = DCFResult.invalid("WACC is unavailable.")
+else:
+    if fcf_value is None:
+        dcf_result = DCFResult.invalid(
+            "Reliable trailing-twelve-month free cash flow was unavailable; the DCF was not run."
+        )
+    elif shares_value is None:
+        dcf_result = DCFResult.invalid("Shares outstanding was unavailable; the DCF was not run.")
+    else:
+        dcf_result = calculate_dcf(
+            fcf_value,
+            stage_1_growth,
+            stage_2_growth,
+            terminal_growth,
+            wacc_result.wacc,
+            shares_value,
+            debt_value,
+            cash_value,
+            duration_1,
+            duration_2,
+        )
 
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Green = Higher Implied Price; Red = Lower Implied Price. N/A for invalid combinations (WACC <= T-Growth).")
-            # --- End Heatmap Creation ---
+    if not dcf_result.valid:
+        st.error(dcf_result.error or "The DCF could not be calculated.")
+    elif current_price is None:
+        st.warning("The DCF is complete, but a current market price was unavailable for the comparison.")
 
-        else:
-            st.warning("Cannot perform sensitivity analysis due to missing FCF or Share data.")
+    upside = None
+    if dcf_result.valid and dcf_result.implied_share_price is not None and current_price not in (None, 0):
+        upside = dcf_result.implied_share_price / current_price - 1.0
+    snapshot = st.columns(6)
+    snapshot[0].metric("Current price", format_currency(current_price))
+    snapshot[1].metric("Implied price", format_currency(dcf_result.implied_share_price if dcf_result.valid else None))
+    snapshot[2].metric("Upside / downside", format_percent(upside, signed=True))
+    snapshot[3].metric("Enterprise value", format_large_currency(dcf_result.enterprise_value if dcf_result.valid else None))
+    snapshot[4].metric("Equity value", format_large_currency(dcf_result.equity_value if dcf_result.valid else None))
+    snapshot[5].metric("WACC", format_percent(wacc_result.wacc))
+    if dcf_result.valid and current_price is not None and upside is not None:
+        direction = "above" if upside >= 0 else "below"
+        st.caption(f"The selected assumptions produce an implied value {direction} the current market price.")
+    st.caption(
+        f"Terminal value contribution to enterprise value: "
+        f"{format_percent(dcf_result.terminal_value_pct_enterprise_value) if dcf_result.valid else 'N/A'} · "
+        "Outputs are assumption-sensitive and intended for educational or analytical use."
+    )
 
+if metrics.free_cash_flow.fallback:
+    st.info(f"FCF source fallback used: {metrics.free_cash_flow.source}")
+neutral_adjustments = []
+if metrics.total_debt.value is None:
+    neutral_adjustments.append("debt unavailable; $0 used for the EV-to-equity adjustment")
+if metrics.cash.value is None:
+    neutral_adjustments.append("cash unavailable; $0 used for the EV-to-equity adjustment")
+if neutral_adjustments:
+    st.info("Data note: " + "; ".join(neutral_adjustments) + ".")
 
-        # --- Reverse DCF Section (Simplified Interpretation) ---
-        st.subheader("Reverse DCF (Implied Growth Analysis)")
-        st.caption("This calculation finds the short-term FCF growth rate (Stage 1) that the market price implies, given your WACC, growth durations, long-term growth, and terminal growth assumptions.")
+st.markdown('<div class="section-kicker">Model inputs</div>', unsafe_allow_html=True)
+st.subheader("DCF assumptions and WACC")
+assumption_columns = st.columns(5)
+assumption_columns[0].metric("Stage 1 growth", format_percent(stage_1_growth))
+assumption_columns[1].metric("Stage 2 growth", format_percent(stage_2_growth))
+assumption_columns[2].metric("Terminal growth", format_percent(terminal_growth))
+assumption_columns[3].metric("Projection period", f"{duration_1 + duration_2} years")
+assumption_columns[4].metric("TTM FCF", format_large_currency(fcf_value))
+source_fallbacks = []
+if wacc_mode == "Automatic" and risk_free_point is not None and risk_free_point.fallback:
+    source_fallbacks.append(f"Risk-free rate: {risk_free_point.source}")
+for label, point in (
+    ("Price", metrics.current_price),
+    ("Shares", metrics.shares_outstanding),
+    ("Debt", metrics.total_debt),
+    ("Cash", metrics.cash),
+    ("Market cap", metrics.market_cap),
+    ("Beta", metrics.beta),
+    ("Interest expense", metrics.interest_expense),
+):
+    if point.fallback:
+        source_fallbacks.append(f"{label}: {point.source}")
+with st.expander("View WACC details and data provenance"):
+    render_wacc_details(wacc_result, wacc_mode, source_fallbacks)
+    provenance = pd.DataFrame(
+        [
+            {"Metric": "Free cash flow", "Value": format_large_currency(fcf_value), "Source": metrics.free_cash_flow.source},
+            {"Metric": "Shares outstanding", "Value": display_value(shares_value, lambda value: f"{value:,.0f}"), "Source": metrics.shares_outstanding.source},
+            {"Metric": "Debt", "Value": format_large_currency(metrics.total_debt.value), "Source": metrics.total_debt.source},
+            {"Metric": "Cash", "Value": format_large_currency(metrics.cash.value), "Source": metrics.cash.source},
+            {"Metric": "Share price", "Value": format_currency(current_price), "Source": metrics.current_price.source},
+        ]
+    )
+    st.dataframe(provenance, hide_index=True, use_container_width=True)
 
-        # Ensure necessary base variables exist and are valid floats
-        current_price_rev = safe_float(info.get('currentPrice') or info.get('regularMarketPrice'))
-        base_fcf_rev = safe_float(fcf if 'fcf' in locals() and fcf > 0 else 0.0)
-        base_shares_rev = safe_float(info.get('sharesOutstanding'))
-        base_debt_rev = safe_float(info.get('totalDebt'))
-        base_cash_rev = safe_float(info.get('totalCash'))
-        g_rate_2_rev = safe_float(g_rate_2 if 'g_rate_2' in locals() else 0.05)
-        t_rate_rev = safe_float(t_rate if 't_rate' in locals() else 0.02)
-        wacc_rev = safe_float(wacc if 'wacc' in locals() and wacc > 0 else 0.10)
+st.markdown('<div class="section-kicker">Explicit forecast</div>', unsafe_allow_html=True)
+st.subheader("Projected cash flows")
+if dcf_result.valid:
+    cash_flow_table = pd.DataFrame(
+        {
+            "Year": [f"Year {year}" for year in range(1, len(dcf_result.projected_fcf) + 1)],
+            "Stage": ["Stage 1" if year <= duration_1 else "Stage 2" for year in range(1, len(dcf_result.projected_fcf) + 1)],
+            "Projected FCF": list(dcf_result.projected_fcf),
+            "Discounted FCF": list(dcf_result.discounted_fcf),
+        }
+    )
+    st.dataframe(
+        cash_flow_table.style.format({"Projected FCF": "${:,.0f}", "Discounted FCF": "${:,.0f}"}),
+        use_container_width=True,
+        hide_index=True,
+    )
+    dcf_details = st.columns(4)
+    dcf_details[0].metric("Terminal value", format_large_currency(dcf_result.terminal_value))
+    dcf_details[1].metric("Discounted terminal value", format_large_currency(dcf_result.discounted_terminal_value))
+    dcf_details[2].metric("Enterprise value", format_large_currency(dcf_result.enterprise_value))
+    dcf_details[3].metric("Equity value", format_large_currency(dcf_result.equity_value))
+else:
+    st.info("Projected cash flows are unavailable until the DCF inputs are valid.")
 
-        if current_price_rev > 0 and base_fcf_rev > 0 and base_shares_rev > 0 and wacc_rev > t_rate_rev:
-            implied_growth = reverse_dcf(
-                current_price=current_price_rev,
-                fcf=base_fcf_rev,
-                g_rate_2=g_rate_2_rev,
-                t_rate=t_rate_rev,
-                wacc=wacc_rev,
-                shares_outstanding=base_shares_rev,
-                total_debt=base_debt_rev,
-                cash=base_cash_rev,
-                duration_1=duration_1, # CHANGED
-                duration_2=duration_2 # CHANGED
-            )
+if dcf_result.valid and shares_value is not None and fcf_value is not None and wacc_result.wacc is not None:
+    render_sensitivity(
+        fcf_value,
+        stage_1_growth,
+        stage_2_growth,
+        terminal_growth,
+        wacc_result.wacc,
+        shares_value,
+        debt_value,
+        cash_value,
+        duration_1,
+        duration_2,
+    )
+else:
+    st.subheader("WACC and terminal-growth sensitivity")
+    st.info("Sensitivity analysis requires a valid DCF, free cash flow, and shares outstanding.")
 
-            if implied_growth is not None:
-                st.metric(label="Current Market Price", value=f"${current_price_rev:,.2f}")
-                st.metric(label=f"Implied FCF Growth (Yrs 1-{duration_1})", value=f"{implied_growth:.2%}")
+st.markdown('<div class="section-kicker">Market-implied assumptions</div>', unsafe_allow_html=True)
+st.subheader("Reverse DCF")
+st.caption("Solves for the Stage 1 FCF growth rate implied by the current market price while holding the other assumptions constant.")
+if current_price is None or fcf_value is None or shares_value is None or wacc_result.wacc is None:
+    st.info("Reverse DCF requires current price, reliable FCF, shares outstanding, and WACC.")
+else:
+    reverse_result = reverse_dcf(
+        current_price,
+        fcf_value,
+        stage_2_growth,
+        terminal_growth,
+        wacc_result.wacc,
+        shares_value,
+        debt_value,
+        cash_value,
+        duration_1,
+        duration_2,
+    )
+    if reverse_result.converged and reverse_result.implied_growth is not None:
+        reverse_columns = st.columns(2)
+        reverse_columns[0].metric("Current market price", format_currency(current_price))
+        reverse_columns[1].metric(
+            f"Implied Stage 1 growth (Years 1–{duration_1})",
+            format_percent(reverse_result.implied_growth),
+        )
+        st.caption("This is the growth rate implied by the model assumptions; it is not a forecast or recommendation.")
+    else:
+        st.warning(reverse_result.error or "Reverse DCF did not converge within the supported range.")
 
-                # --- Simplified Interpretation ---
-                interpretation = f"The current market price implies **{implied_growth:.1%}** annual FCF growth for the next **{duration_1}** years. " # CHANGED
-
-                # Add qualitative assessment based on magnitude
-                if implied_growth > 0.30:
-                    st.warning(interpretation + "This required growth rate is **very aggressive**.")
-                elif implied_growth > 0.15:
-                    st.info(interpretation + "This required growth rate is **optimistic**.")
-                elif implied_growth > 0.05:
-                    st.success(interpretation + "This required growth rate seems **plausible** for a growing company.")
-                elif implied_growth >= 0:
-                     st.success(interpretation + "This required growth rate is **conservative**.")
-                else: # Negative growth
-                     st.error(interpretation + "The market appears to be pricing in a **decline** in FCF.")
-                # --- End Simplified Interpretation ---
-
-            else:
-                st.warning("Could not converge on an implied growth rate. The current price might be too high/low for the model assumptions (WACC, long-term growth, terminal growth), input data might be missing, or the calculation encountered an error.")
-        else:
-            st.warning("Could not calculate implied growth due to missing/invalid data (Price, FCF, Shares) or WACC <= Terminal Rate.")
-
-    except Exception as e:
-        st.error(f"A critical error occurred loading data for {ticker}.")
-        st.error(f"Debug info: {e}")
+render_comps(company.ticker, peers_input)
+render_methodology()
