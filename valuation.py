@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 
 MIN_TERMINAL_SPREAD = 0.005
@@ -35,7 +35,7 @@ def _validate_number(name: str, value: object) -> Optional[str]:
 
 @dataclass(frozen=True)
 class DCFResult:
-    """The complete output of a two-stage DCF calculation."""
+    """The complete output of either supported DCF forecast method."""
 
     valid: bool
     error: Optional[str] = None
@@ -51,6 +51,138 @@ class DCFResult:
     @classmethod
     def invalid(cls, message: str) -> "DCFResult":
         return cls(valid=False, error=message)
+
+
+def calculate_dcf_from_fcf(
+    annual_fcf: Sequence[object],
+    terminal_growth: object,
+    wacc: object,
+    shares_outstanding: object,
+    total_debt: object = 0.0,
+    cash: object = 0.0,
+    minimum_terminal_spread: float = MIN_TERMINAL_SPREAD,
+) -> DCFResult:
+    """Value an explicit annual FCF sequence using the shared DCF mechanics.
+
+    Explicit forecast years may contain positive, zero, or negative FCF.  The
+    final explicit year must be positive so the Gordon-growth terminal value
+    remains economically meaningful and numerically stable.
+    """
+
+    if isinstance(annual_fcf, (str, bytes)):
+        return DCFResult.invalid("Annual FCF forecast must be a sequence of numbers.")
+    try:
+        forecast = tuple(_finite(value) for value in annual_fcf)
+    except TypeError:
+        return DCFResult.invalid("Annual FCF forecast must be a sequence of numbers.")
+    if not forecast:
+        return DCFResult.invalid("Annual FCF forecast must contain at least one year.")
+    if any(value is None for value in forecast):
+        return DCFResult.invalid("Annual FCF forecast must contain only finite numbers.")
+
+    required = {
+        "terminal growth": terminal_growth,
+        "WACC": wacc,
+        "shares outstanding": shares_outstanding,
+        "total debt": total_debt,
+        "cash": cash,
+    }
+    for name, value in required.items():
+        error = _validate_number(name, value)
+        if error:
+            return DCFResult.invalid(error)
+
+    terminal = float(terminal_growth)
+    discount_rate = float(wacc)
+    shares = float(shares_outstanding)
+    debt = float(total_debt)
+    cash_value = float(cash)
+    projected = tuple(float(value) for value in forecast)
+
+    if shares <= 0:
+        return DCFResult.invalid("Shares outstanding must be positive to calculate an implied price.")
+    if debt < 0 or cash_value < 0:
+        return DCFResult.invalid("Debt and cash must be zero or positive.")
+    if discount_rate <= 0:
+        return DCFResult.invalid("WACC must be greater than zero.")
+    if terminal <= -1:
+        return DCFResult.invalid("Terminal growth must be greater than -100%.")
+    if discount_rate <= terminal:
+        return DCFResult.invalid("WACC must be greater than terminal growth.")
+    if discount_rate - terminal < minimum_terminal_spread:
+        return DCFResult.invalid(
+            "WACC and terminal growth are too close; use at least a 0.5% spread."
+        )
+    if projected[-1] <= 0:
+        return DCFResult.invalid(
+            "The final forecast FCF must be positive to calculate terminal value."
+        )
+
+    try:
+        terminal_value = projected[-1] * (1.0 + terminal) / (discount_rate - terminal)
+        discounted = [
+            value / ((1.0 + discount_rate) ** year)
+            for year, value in enumerate(projected, start=1)
+        ]
+        discounted_terminal = terminal_value / ((1.0 + discount_rate) ** len(projected))
+        enterprise_value = sum(discounted) + discounted_terminal
+        equity_value = enterprise_value - debt + cash_value
+        implied_price = equity_value / shares
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return DCFResult.invalid("The DCF calculation produced an invalid result.")
+
+    outputs = [terminal_value, discounted_terminal, enterprise_value, equity_value, implied_price]
+    if not all(math.isfinite(value) for value in outputs + discounted):
+        return DCFResult.invalid("The DCF produced a non-finite result.")
+    if enterprise_value == 0:
+        return DCFResult.invalid("The DCF produced a zero enterprise value.")
+
+    return DCFResult(
+        valid=True,
+        projected_fcf=projected,
+        discounted_fcf=tuple(discounted),
+        terminal_value=terminal_value,
+        discounted_terminal_value=discounted_terminal,
+        enterprise_value=enterprise_value,
+        equity_value=equity_value,
+        implied_share_price=implied_price,
+        terminal_value_pct_enterprise_value=discounted_terminal / enterprise_value,
+    )
+
+
+def project_two_stage_fcf(
+    fcf: object,
+    stage_1_growth: object,
+    stage_2_growth: object,
+    duration_1: int,
+    duration_2: int,
+) -> tuple[float, ...]:
+    """Generate the existing two-stage annual FCF path for reuse by the UI."""
+
+    values = (fcf, stage_1_growth, stage_2_growth)
+    if any(_finite(value) is None for value in values):
+        return tuple()
+    if not isinstance(duration_1, int) or isinstance(duration_1, bool) or duration_1 <= 0:
+        return tuple()
+    if not isinstance(duration_2, int) or isinstance(duration_2, bool) or duration_2 <= 0:
+        return tuple()
+
+    current_fcf = float(fcf)
+    stage_1 = float(stage_1_growth)
+    stage_2 = float(stage_2_growth)
+    if current_fcf <= 0 or stage_1 <= -1 or stage_2 <= -1:
+        return tuple()
+
+    projected: list[float] = []
+    try:
+        for year in range(1, duration_1 + duration_2 + 1):
+            current_fcf *= 1.0 + (stage_1 if year <= duration_1 else stage_2)
+            if not math.isfinite(current_fcf):
+                return tuple()
+            projected.append(current_fcf)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return tuple()
+    return tuple(projected)
 
 
 def calculate_dcf(
@@ -119,45 +251,24 @@ def calculate_dcf(
             "WACC and terminal growth are too close; use at least a 0.5% spread."
         )
 
-    total_duration = duration_1 + duration_2
-    projected: list[float] = []
-    current_fcf = fcf_value
-    try:
-        for year in range(1, total_duration + 1):
-            growth = stage_1 if year <= duration_1 else stage_2
-            current_fcf *= 1.0 + growth
-            if not math.isfinite(current_fcf):
-                return DCFResult.invalid("The projected free cash flows are not finite.")
-            projected.append(current_fcf)
+    projected = project_two_stage_fcf(
+        fcf_value,
+        stage_1,
+        stage_2,
+        duration_1,
+        duration_2,
+    )
+    if not projected:
+        return DCFResult.invalid("The projected free cash flows are not finite.")
 
-        terminal_value = projected[-1] * (1.0 + terminal) / (discount_rate - terminal)
-        discounted = [
-            value / ((1.0 + discount_rate) ** year)
-            for year, value in enumerate(projected, start=1)
-        ]
-        discounted_terminal = terminal_value / ((1.0 + discount_rate) ** total_duration)
-        enterprise_value = sum(discounted) + discounted_terminal
-        equity_value = enterprise_value - debt + cash_value
-        implied_price = equity_value / shares
-    except (OverflowError, ValueError, ZeroDivisionError):
-        return DCFResult.invalid("The DCF calculation produced an invalid result.")
-
-    outputs = [terminal_value, discounted_terminal, enterprise_value, equity_value, implied_price]
-    if not all(math.isfinite(value) for value in outputs + discounted):
-        return DCFResult.invalid("The DCF produced a non-finite result.")
-    if enterprise_value == 0:
-        return DCFResult.invalid("The DCF produced a zero enterprise value.")
-
-    return DCFResult(
-        valid=True,
-        projected_fcf=tuple(projected),
-        discounted_fcf=tuple(discounted),
-        terminal_value=terminal_value,
-        discounted_terminal_value=discounted_terminal,
-        enterprise_value=enterprise_value,
-        equity_value=equity_value,
-        implied_share_price=implied_price,
-        terminal_value_pct_enterprise_value=discounted_terminal / enterprise_value,
+    return calculate_dcf_from_fcf(
+        projected,
+        terminal_growth,
+        wacc,
+        shares_outstanding,
+        total_debt,
+        cash,
+        minimum_terminal_spread,
     )
 
 

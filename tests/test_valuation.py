@@ -1,6 +1,6 @@
 import pytest
 
-from valuation import calculate_dcf, calculate_wacc, reverse_dcf
+from valuation import calculate_dcf, calculate_dcf_from_fcf, calculate_wacc, reverse_dcf
 
 
 BASE_CASE = {
@@ -98,3 +98,48 @@ def test_automatic_wacc_marks_missing_market_cap_as_fallback():
     assert result.valid
     assert result.fallback_used
     assert result.wacc == pytest.approx(0.10)
+
+
+def test_explicit_fcf_sequence_matches_shared_dcf_valuation():
+    result = calculate_dcf_from_fcf(
+        annual_fcf=(110.0, 115.5),
+        terminal_growth=BASE_CASE["terminal_growth"],
+        wacc=BASE_CASE["wacc"],
+        shares_outstanding=BASE_CASE["shares_outstanding"],
+        total_debt=BASE_CASE["total_debt"],
+        cash=BASE_CASE["cash"],
+    )
+
+    assert result.valid
+    assert result.implied_share_price == pytest.approx(138.25)
+
+
+def test_explicit_forecast_allows_negative_intermediate_fcf():
+    result = calculate_dcf_from_fcf(
+        annual_fcf=(100.0, -20.0, 50.0),
+        terminal_growth=0.02,
+        wacc=0.10,
+        shares_outstanding=10.0,
+    )
+
+    assert result.valid
+    assert result.projected_fcf[1] == -20.0
+    assert result.discounted_fcf[1] < 0
+
+
+def test_sensitivity_changes_discounting_but_not_explicit_projected_fcf():
+    annual_fcf = (100.0, -20.0, 50.0)
+    low_wacc = calculate_dcf_from_fcf(annual_fcf, 0.02, 0.10, 10.0)
+    high_wacc = calculate_dcf_from_fcf(annual_fcf, 0.02, 0.12, 10.0)
+
+    assert low_wacc.valid and high_wacc.valid
+    assert high_wacc.projected_fcf == low_wacc.projected_fcf == annual_fcf
+    assert high_wacc.discounted_fcf != low_wacc.discounted_fcf
+    assert high_wacc.implied_share_price < low_wacc.implied_share_price
+
+
+def test_nonpositive_final_fcf_rejects_terminal_value():
+    result = calculate_dcf_from_fcf((100.0, 0.0, -10.0), 0.02, 0.10, 10.0)
+
+    assert not result.valid
+    assert "final forecast FCF" in result.error
