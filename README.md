@@ -55,6 +55,6 @@ python -m compileall .
 
 The valuation tests are deterministic and do not require internet access. Live Yahoo Finance responses are intentionally not part of the test suite.
 
-## Limitations and educational-use disclaimer
+## Limitations
 
-Yahoo Finance data may be delayed, revised, incomplete, or inconsistent between issuers. DCF outputs are highly sensitive to growth, WACC, terminal growth, and the quality of the underlying FCF data. Comparable-company multiples provide market context rather than a standalone valuation conclusion. This project is for educational and analytical use only and is not investment advice or a recommendation to buy or sell securities.
+Yahoo Finance data may be delayed, revised, incomplete, or inconsistent between issuers. DCF outputs are highly sensitive to growth, WACC, terminal growth, and the quality of the underlying FCF data. Comparable-company multiples provide market context rather than a standalone valuation conclusion.

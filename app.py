@@ -97,6 +97,124 @@ def display_value(value: object, formatter=format_currency) -> str:
     return formatter(value) if value is not None else "N/A"
 
 
+DEFAULT_TWO_STAGE_SETTINGS = {
+    "stage_1_percent": 30.0,
+    "stage_2_percent": 10.0,
+    "duration_1": 5,
+    "duration_2": 5,
+}
+
+
+def seed_custom_fcf_values(fcf_value: object, forecast_years: int) -> list[object]:
+    """Create one-time custom-mode defaults without coupling later edits to DCF inputs."""
+
+    settings = st.session_state.get("last_two_stage_settings", DEFAULT_TWO_STAGE_SETTINGS)
+    seed_path = project_two_stage_fcf(
+        fcf_value,
+        settings["stage_1_percent"] / 100.0,
+        settings["stage_2_percent"] / 100.0,
+        settings["duration_1"],
+        settings["duration_2"],
+    )
+    seeded_values = [value / 1e9 for value in seed_path]
+    return [
+        seeded_values[year - 1] if year <= len(seeded_values) else None
+        for year in range(1, forecast_years + 1)
+    ]
+
+
+def resize_custom_fcf_values(
+    values: list[object],
+    forecast_years: int,
+    fallback_values: list[object],
+) -> list[object]:
+    resized = list(values[:forecast_years])
+    for index in range(len(resized), forecast_years):
+        resized.append(fallback_values[index] if index < len(fallback_values) else None)
+    return resized
+
+
+def parse_custom_fcf_values(edited_forecast: pd.DataFrame) -> tuple[tuple[float, ...] | None, str | None]:
+    values: list[float] = []
+    invalid_years: list[str] = []
+    years = edited_forecast["Year"].tolist()
+    for year, raw_value in zip(years, edited_forecast["FCF ($B)"].tolist()):
+        if raw_value is None or isinstance(raw_value, bool):
+            invalid_years.append(str(year))
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            invalid_years.append(str(year))
+            continue
+        if not math.isfinite(value):
+            invalid_years.append(str(year))
+            continue
+        values.append(value)
+
+    if invalid_years:
+        years_label = ", ".join(f"Year {year}" for year in invalid_years)
+        return None, f"Enter a finite numeric FCF ($B) value for every forecast year. Missing or invalid value(s): {years_label}."
+    return tuple(value * 1e9 for value in values), None
+
+
+def render_custom_fcf_editor(
+    ticker: str,
+    fcf_value: object,
+    forecast_years: int,
+) -> tuple[tuple[float, ...] | None, str | None]:
+    state_key = f"custom_fcf_values_{ticker}"
+    fallback_values = seed_custom_fcf_values(fcf_value, forecast_years)
+    stored_values = st.session_state.get(state_key)
+    if stored_values is None:
+        stored_values = fallback_values
+    else:
+        stored_values = resize_custom_fcf_values(
+            list(stored_values),
+            forecast_years,
+            fallback_values,
+        )
+
+    length_key = f"custom_fcf_editor_length_{ticker}"
+    revision_key = f"custom_fcf_editor_revision_{ticker}"
+    if st.session_state.get(length_key) != forecast_years:
+        st.session_state[length_key] = forecast_years
+        st.session_state[revision_key] = st.session_state.get(revision_key, 0) + 1
+    editor_key = f"custom_fcf_editor_{ticker}_{st.session_state[revision_key]}"
+
+    forecast_df = pd.DataFrame(
+        {
+            "Year": list(range(1, forecast_years + 1)),
+            "FCF ($B)": stored_values,
+        }
+    )
+    edited_forecast = st.data_editor(
+        forecast_df,
+        key=editor_key,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "Year": st.column_config.NumberColumn("Year", format="%d", disabled=True),
+            "FCF ($B)": st.column_config.NumberColumn(
+                "FCF ($B)",
+                format="%.3f",
+                help="Enter the analyst-supplied annual free cash flow in $ billions. Zero and negative values are allowed.",
+            ),
+        },
+    )
+
+    edited_values = edited_forecast["FCF ($B)"].tolist()
+    stored_values = resize_custom_fcf_values(
+        list(stored_values),
+        forecast_years,
+        fallback_values,
+    )
+    stored_values[:forecast_years] = edited_values
+    st.session_state[state_key] = stored_values
+    return parse_custom_fcf_values(edited_forecast)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_comps(tickers: tuple[str, ...]):
     return get_comps_data(tickers)
@@ -199,14 +317,14 @@ def render_sensitivity(
     st.plotly_chart(figure, use_container_width=True)
     st.caption(
         f"★ Base case: WACC {format_percent(wacc, 2)}, terminal growth {format_percent(terminal_growth, 2)}. "
-        "Prices are scenario outputs, not investment recommendations."
+        "Prices are scenario outputs under the selected assumptions."
     )
 
 
 def render_forecast_chart(
     result: DCFResult,
     forecast_method: str,
-    duration_1: int,
+    duration_1: int | None,
 ) -> None:
     """Show projected and discounted FCF without interpreting the forecast."""
 
@@ -237,7 +355,7 @@ def render_forecast_chart(
         )
     )
     figure.add_hline(y=0, line_width=1, line_color="#9ca3af")
-    if forecast_method == "Two-stage growth":
+    if forecast_method == "Two-stage growth" and duration_1 is not None:
         figure.add_vline(
             x=duration_1 + 0.5,
             line_width=1,
@@ -256,7 +374,7 @@ def render_forecast_chart(
         plot_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(figure, use_container_width=True)
-    if forecast_method == "Two-stage growth":
+    if forecast_method == "Two-stage growth" and duration_1 is not None:
         st.caption("The dotted vertical line marks the Stage 1 / Stage 2 boundary. The zero line is shown for reference.")
     else:
         st.caption("The zero line is shown for reference; custom annual FCF values are analyst-supplied assumptions.")
@@ -299,7 +417,7 @@ def render_methodology() -> None:
 
             Automatic WACC uses CAPM for the cost of equity and an estimated pretax cost of debt weighted by market-value equity and debt. Missing inputs are labeled when a fallback is used. Reverse DCF solves for the Stage 1 growth rate implied by the current market price under the remaining assumptions.
 
-            Results are highly sensitive to growth, WACC, terminal value, and data quality. Yahoo Finance values can be delayed, revised, incomplete, or inconsistent across issuers. Comparable-company multiples are point-in-time context and do not establish fair value. This dashboard is for educational and analytical use only, not investment advice.
+            Results are highly sensitive to growth, WACC, terminal value, and data quality. Yahoo Finance values can be delayed, revised, incomplete, or inconsistent across issuers. Comparable-company multiples are point-in-time context and do not establish fair value.
             """
         )
 
@@ -310,7 +428,7 @@ ticker = st.sidebar.text_input(
     "AAPL",
     help="Yahoo Finance symbol, for example AAPL or MSFT.",
 ).strip().upper()
-run_button = st.sidebar.button("Run analysis", type="primary", use_container_width=True)
+run_button = st.sidebar.button("Load company data", type="primary", use_container_width=True)
 
 with st.sidebar.expander("DCF assumptions", expanded=True):
     forecast_method = st.radio(
@@ -320,26 +438,65 @@ with st.sidebar.expander("DCF assumptions", expanded=True):
     )
     if forecast_method == "Two-stage growth":
         st.caption("Fast scenario-analysis mode using Stage 1 and Stage 2 growth rates.")
+        stage_settings = st.session_state.get("last_two_stage_settings", DEFAULT_TWO_STAGE_SETTINGS)
+        stage_1_percent = st.slider(
+            "Stage 1 FCF growth",
+            min_value=-50.0,
+            max_value=100.0,
+            value=stage_settings["stage_1_percent"],
+            step=1.0,
+            format="%.0f%%",
+            key="stage_1_percent",
+            help="Annual free-cash-flow growth during the first projection stage.",
+        )
+        stage_2_percent = st.slider(
+            "Stage 2 FCF growth",
+            min_value=-20.0,
+            max_value=30.0,
+            value=stage_settings["stage_2_percent"],
+            step=1.0,
+            format="%.0f%%",
+            key="stage_2_percent",
+            help="Annual free-cash-flow growth during the second projection stage.",
+        )
+        duration_1 = st.slider(
+            "Stage 1 duration",
+            1,
+            10,
+            stage_settings["duration_1"],
+            format="%d years",
+            key="duration_1",
+        )
+        duration_2 = st.slider(
+            "Stage 2 duration",
+            1,
+            10,
+            stage_settings["duration_2"],
+            format="%d years",
+            key="duration_2",
+        )
+        st.session_state["last_two_stage_settings"] = {
+            "stage_1_percent": stage_1_percent,
+            "stage_2_percent": stage_2_percent,
+            "duration_1": duration_1,
+            "duration_2": duration_2,
+        }
     else:
         st.caption("Enter analyst-supplied annual FCF after the company data loads. Zero and negative years are allowed.")
-    stage_1_percent = st.slider(
-        "Stage 1 FCF growth",
-        min_value=-50.0,
-        max_value=100.0,
-        value=30.0,
-        step=1.0,
-        format="%.0f%%",
-        help="Annual free-cash-flow growth during the first projection stage.",
-    )
-    stage_2_percent = st.slider(
-        "Stage 2 FCF growth",
-        min_value=-20.0,
-        max_value=30.0,
-        value=10.0,
-        step=1.0,
-        format="%.0f%%",
-        help="Annual free-cash-flow growth during the second projection stage.",
-    )
+        explicit_forecast_years = st.slider(
+            "Explicit forecast years",
+            min_value=5,
+            max_value=15,
+            value=st.session_state.get("last_custom_forecast_years", 10),
+            format="%d years",
+            key="explicit_forecast_years",
+            help="Number of annual free-cash-flow values in the custom forecast.",
+        )
+        st.session_state["last_custom_forecast_years"] = explicit_forecast_years
+        stage_1_growth = None
+        stage_2_growth = None
+        duration_1 = None
+        duration_2 = None
     terminal_percent = st.slider(
         "Terminal growth",
         min_value=-1.0,
@@ -349,8 +506,6 @@ with st.sidebar.expander("DCF assumptions", expanded=True):
         format="%.1f%%",
         help="Perpetual growth rate after the explicit projection period.",
     )
-    duration_1 = st.slider("Stage 1 duration", 1, 10, 5, format="%d years")
-    duration_2 = st.slider("Stage 2 duration", 1, 10, 5, format="%d years")
 
 with st.sidebar.expander("Discount rate (WACC)", expanded=True):
     wacc_mode = st.radio(
@@ -382,8 +537,9 @@ with st.sidebar.expander("Comparable companies"):
         help="Comma-separated Yahoo Finance symbols.",
     )
 
-stage_1_growth = stage_1_percent / 100.0
-stage_2_growth = stage_2_percent / 100.0
+if forecast_method == "Two-stage growth":
+    stage_1_growth = stage_1_percent / 100.0
+    stage_2_growth = stage_2_percent / 100.0
 terminal_growth = terminal_percent / 100.0
 
 st.title("Financial Valuation Dashboard")
@@ -391,12 +547,16 @@ st.caption("Interactive DCF and scenario analysis using live Yahoo Finance data"
 
 reuse_cached_analysis = (
     not run_button
-    and forecast_method == "Custom annual FCF"
     and st.session_state.get("analysis_ticker") == ticker
     and st.session_state.get("analysis_company") is not None
 )
 if not run_button and not reuse_cached_analysis:
-    st.info("Enter a ticker and select Run analysis to load the company profile, valuation, scenarios, and comps.")
+    st.info("Enter a ticker and select Load company data to load the company profile, valuation, scenarios, and comps.")
+    if forecast_method == "Custom annual FCF":
+        st.markdown('<div class="section-kicker">Custom forecast</div>', unsafe_allow_html=True)
+        st.subheader("Custom annual FCF")
+        st.write("Enter your own free cash flow forecast for each explicit forecast year.")
+        st.info("Load company data to initialize the annual FCF forecast.")
     render_methodology()
     st.stop()
 
@@ -444,41 +604,23 @@ current_price = metrics.current_price.value
 fcf_value = metrics.free_cash_flow.value
 
 custom_fcf_values: tuple[float, ...] | None = None
+custom_fcf_error: str | None = None
 if forecast_method == "Custom annual FCF":
-    total_duration = duration_1 + duration_2
-    seed_path = project_two_stage_fcf(
+    st.markdown('<div class="section-kicker">Custom forecast</div>', unsafe_allow_html=True)
+    st.subheader("Custom annual FCF")
+    st.write("Enter your own free cash flow forecast for each explicit forecast year.")
+    st.caption("Values are entered in $ billions. Positive, zero, and negative intermediate FCF values are supported.")
+    custom_fcf_values, custom_fcf_error = render_custom_fcf_editor(
+        company.ticker,
         fcf_value,
-        stage_1_growth,
-        stage_2_growth,
-        duration_1,
-        duration_2,
+        explicit_forecast_years,
     )
-    if not seed_path:
-        seed_path = tuple(0.0 for _ in range(total_duration))
-    custom_inputs_billions: list[float] = []
-    with st.sidebar.expander("Custom annual FCF inputs", expanded=True):
-        st.caption(
-            f"Analyst-supplied forecast in $ billions for {total_duration} explicit years. "
-            "The initial values are seeded from the two-stage path and can be edited independently."
-        )
-        for year in range(1, total_duration + 1):
-            state_key = f"custom_fcf_{company.ticker}_{year}"
-            if state_key not in st.session_state:
-                st.session_state[state_key] = seed_path[year - 1] / 1e9
-            custom_inputs_billions.append(
-                st.number_input(
-                    f"Year {year} FCF ($B)",
-                    key=state_key,
-                    step=0.1,
-                    format="%.3f",
-                    help="Enter the analyst-supplied annual free cash flow. Zero and negative values are allowed.",
-                )
-            )
-    custom_fcf_values = tuple(value * 1e9 for value in custom_inputs_billions)
+    if custom_fcf_error:
+        st.error(custom_fcf_error)
 
 forecast_fcf = (
     custom_fcf_values
-    if forecast_method == "Custom annual FCF" and custom_fcf_values is not None
+    if forecast_method == "Custom annual FCF"
     else project_two_stage_fcf(fcf_value, stage_1_growth, stage_2_growth, duration_1, duration_2)
 )
 
@@ -506,6 +648,8 @@ if not wacc_result.valid or wacc_result.wacc is None:
 else:
     if shares_value is None:
         dcf_result = DCFResult.invalid("Shares outstanding was unavailable; the DCF was not run.")
+    elif forecast_method == "Custom annual FCF" and forecast_fcf is None:
+        dcf_result = DCFResult.invalid(custom_fcf_error or "Enter a finite FCF value for every explicit forecast year.")
     elif forecast_method == "Custom annual FCF":
         dcf_result = calculate_dcf_from_fcf(
             forecast_fcf,
@@ -533,7 +677,7 @@ else:
             duration_2,
         )
 
-    if not dcf_result.valid:
+    if not dcf_result.valid and not (forecast_method == "Custom annual FCF" and custom_fcf_error):
         st.error(dcf_result.error or "The DCF could not be calculated.")
     elif current_price is None:
         st.warning("The DCF is complete, but a current market price was unavailable for the comparison.")
@@ -554,7 +698,7 @@ else:
     st.caption(
         f"Terminal value contribution to enterprise value: "
         f"{format_percent(dcf_result.terminal_value_pct_enterprise_value) if dcf_result.valid else 'N/A'} · "
-        "Outputs are assumption-sensitive and intended for educational or analytical use."
+        "Outputs are assumption-sensitive."
     )
 
 if metrics.free_cash_flow.fallback:
@@ -579,7 +723,7 @@ if forecast_method == "Two-stage growth":
 else:
     assumption_columns[0].metric("Forecast method", forecast_method)
     assumption_columns[1].metric("Terminal growth", format_percent(terminal_growth))
-    assumption_columns[2].metric("Projection period", f"{duration_1 + duration_2} years")
+    assumption_columns[2].metric("Explicit forecast years", f"{explicit_forecast_years} years")
     assumption_columns[3].metric("FCF input units", "$ billions")
     assumption_columns[4].metric("TTM FCF reference", format_large_currency(fcf_value))
 source_fallbacks = []
@@ -686,7 +830,7 @@ else:
             f"Implied Stage 1 growth (Years 1–{duration_1})",
             format_percent(reverse_result.implied_growth),
         )
-        st.caption("This is the growth rate implied by the model assumptions; it is not a forecast or recommendation.")
+        st.caption("This is the growth rate implied by the selected model assumptions.")
     else:
         st.warning(reverse_result.error or "Reverse DCF did not converge within the supported range.")
 
